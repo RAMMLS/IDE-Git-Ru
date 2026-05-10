@@ -8,6 +8,13 @@ pub fn CreateNewFile(path: &Path) -> Result<PathBuf, std::io::Error> {
 }
 
 pub fn CreateFileInDir(dir: &Path, filename: &str) -> Result<PathBuf, std::io::Error> {
+    let file_path = dir.join(filename);
+
+    // Получаем родительскую папку
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)?; // Создаст недостающие папки
+    }
+    
     std::fs::create_dir_all(dir)?; // Убедимся, что директория существует
     let file_path = dir.join(filename);
     std::fs::File::create(&file_path)?; // Создаем файл

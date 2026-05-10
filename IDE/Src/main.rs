@@ -19,6 +19,9 @@ pub enum Message {
     EditorAction(text_editor::Action),
     // Команда создать новый файл (можем расширить, добавив параметры для пути и имени файла)
     CreateNewFile(std::path::PathBuf, String),
+
+    // Сохранение
+    SaveFiles,
 }
 
 // Реализация логики Iced для нашей структуры
@@ -49,34 +52,46 @@ impl Application for MyIde {
 
     // Обновление состояния (реакция на Message)
     fn update(&mut self, message: Message) -> Command<Message> {
+    match message {
+        Message::EditorAction(action) => {
+            self.content.perform(action);
+            self.state.is_dirty = true;
+        }
 
-        
-        // Сохранение файла
-        match message {
-            Message::EditorAction(action) => {
-                self.content.perform(action);
-                self.state.is_dirty = true;
-            }
-
-            Message::CreateNewFile(dir, filename) => {
-                match core::filesystem::CreateFileInDir(&dir, &filename) {
-                    Ok(path) => {
-                        self.state.current_file = Some(path);
-                        self.content = text_editor::Content::new();
-                        self.state.is_dirty = false;
-                    }
-
-                    Err(e) => {
-                        eprintln!("Не удалось создать файл: {}", e);
-                    }
+        Message::CreateNewFile(dir, filename) => {
+            match core::filesystem::CreateFileInDir(&dir, &filename) {
+                Ok(path) => {
+                    self.state.current_file = Some(path);
+                    self.content = text_editor::Content::new();
+                    self.state.is_dirty = false;
                 }
-
+                Err(e) => {
+                    eprintln!("Не удалось создать файл: {}", e);
+                }
             }
         }
-        Command::none()
 
-        
-    }       
+        Message::SaveFiles => {
+            if let Some(ref path) = self.state.current_file {
+                let text = self.content.text();
+                // здесь должно быть core::filesystem::save_file (если ты так назвал)
+                match core::filesystem::SaveFiles(path, &text) {
+                    Ok(()) => {
+                        self.state.is_dirty = false;
+                    }
+                    Err(e) => {
+                        eprintln!("Ошибка сохранения: {}", e);
+                    }
+                }
+            } else {
+                // Заглушка под "Сохранить как"
+            }
+        }
+    }
+    Command::none()
+}
+
+
 
     // Отрисовка интерфейса
     fn view(&self) -> Element<Message> {

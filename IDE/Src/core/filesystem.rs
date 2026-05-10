@@ -13,3 +13,7 @@ pub fn CreateFileInDir(dir: &Path, filename: &str) -> Result<PathBuf, std::io::E
     std::fs::File::create(&file_path)?; // Создаем файл
     Ok(file_path) // Возвращаем путь к новому файлу
 }
+
+pub fn SaveFiles(path: &Path, content: &str) -> Result<(), std::io::Error> {
+    std::fs::write(path, content)
+}

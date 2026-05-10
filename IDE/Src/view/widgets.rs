@@ -9,6 +9,12 @@ use crate::Message;
 
 /// Строит весь интерфейс IDE
 pub fn build_widget(ide: &MyIde) -> Element<Message> {
+
+
+    // Сохранение дока
+    let save_button = button("Save")
+        .on_press(Message::SaveFiles);
+
     // 1. Кнопка "Новый файл"
     let new_file_button = button("New File")
         .on_press(Message::CreateNewFile(
@@ -27,6 +33,7 @@ pub fn build_widget(ide: &MyIde) -> Element<Message> {
     let side_bar = container(
         column![
             new_file_button,
+            save_button,
             file_info_text,
         ]
         .spacing(10)
@@ -49,4 +56,7 @@ pub fn build_widget(ide: &MyIde) -> Element<Message> {
         editor_area,
     ]
     .into()   // преобразуем в Element
+
+    // 6. Сейв
+    
 }

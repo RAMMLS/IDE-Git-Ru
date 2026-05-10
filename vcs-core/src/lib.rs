@@ -19,7 +19,7 @@ pub mod refs;
 mod repository;
 
 pub use repository::{
-    ChangeKind, CommitSummary, DiffLine, FileDiff, RepositoryStatus, StatusEntry,
+    ChangeKind, CommitSummary, DiffLine, FileDiff, PushSummary, RepositoryStatus, StatusEntry,
 };
 
 /// Name of the metadata directory used by Aura repositories.
@@ -86,6 +86,9 @@ pub enum AuraError {
     /// A branch could not be located.
     #[error("branch `{0}` does not exist")]
     BranchNotFound(String),
+    /// A remote could not be located.
+    #[error("remote `{0}` does not exist")]
+    RemoteNotFound(String),
 }
 
 /// Timestamp captured from the backing filesystem.

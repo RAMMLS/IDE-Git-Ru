@@ -49,9 +49,11 @@ Aura хранит объекты по модели, близкой к Git:
 - `init`
 - `add`
 - `commit`
+- `push`
 - `status`
 - `log`
 - `branch`
+- `remote add`
 - `checkout`
 - `diff`
 
@@ -85,7 +87,10 @@ cargo check
 - проверяет наличие `cargo`;
 - при необходимости ставит Rust через `winget`;
 - добавляет `%USERPROFILE%\.cargo\bin` в пользовательский `PATH`;
-- устанавливает локальный бинарник `aura`.
+- устанавливает локальный бинарник `aura`;
+- ставит PowerShell-интеграцию в пользовательские профили;
+- создаёт `aura.cmd` shim в уже доступной пользовательской директории из `PATH`, чтобы команда поднималась даже в IDE-терминалах со старым окружением;
+- проверяет, что `aura help` запускается из произвольной папки, а не только из каталога проекта.
 
 Ручной вариант установки:
 
@@ -99,6 +104,9 @@ cargo install --path .\vcs-core --bin aura --force
 aura help
 ```
 
+После запуска `install-aura.bat` команда `aura` должна открываться из любого каталога.
+Если IDE держит старый `PATH`, установщик дополнительно поднимает PowerShell-функцию и `aura.cmd` shim для новых терминалов.
+
 ## CLI
 
 Основная точка входа для ручной проверки находится в `vcs-core/src/main.rs`.
@@ -106,36 +114,74 @@ aura help
 Общий формат:
 
 ```powershell
-aura [--repo PATH] <command> [args]
+aura [-C PATH | --repo PATH] <command> [args]
 ```
+
+Особенности поведения:
+
+- `aura` автоматически ищет `.aura` в текущей папке и во всех родительских каталогах;
+- `aura status`, `aura log`, `aura diff`, `aura branch`, `aura checkout` и `aura switch` можно вызывать из любой вложенной папки репозитория;
+- `aura add` интерпретирует относительные пути от текущей директории, как это делает `git`;
+- `aura add -A` индексирует всё рабочее дерево и одновременно stage-ит удаления;
+- `-C PATH` и `--repo PATH` позволяют работать с репозиторием, не переходя в него;
+- `aura commit -m "message"` поддерживается как основной способ задания сообщения;
+- `aura push` и `aura push origin <branch>` пока работают с локальными Aura-репозиториями через именованные remotes.
 
 Доступные команды:
 
 - `init [PATH]` - инициализирует новый Aura-репозиторий;
 - `add <PATH>...` - добавляет файлы и директории в индекс;
-- `commit <MESSAGE>` - создаёт коммит из текущего индекса;
+- `add -A` - индексирует все файлы репозитория и stage-ит удаления;
+- `commit [-m] <MESSAGE>` - создаёт коммит из текущего индекса;
 - `status` - показывает staged, unstaged и untracked изменения;
 - `log` - показывает историю коммитов;
 - `branch [NAME]` - выводит список веток или создаёт новую;
+- `remote add <NAME> <PATH>` - настраивает локальный remote-репозиторий;
+- `push [REMOTE] [BRANCH]` - пушит текущую или указанную ветку в remote;
+  если передан один аргумент и это локальная ветка, Aura трактует команду как `push origin <BRANCH>`;
 - `checkout <NAME>` - переключает рабочее дерево на ветку;
+- `switch <NAME>` - алиас для `checkout`;
 - `diff` - показывает diff рабочей директории относительно индекса.
 
 Примеры:
 
 ```powershell
 aura init ..\demo-repo
+aura init ..\demo-remote
+aura -C ..\demo-repo remote add origin ..\demo-remote
 
 Set-Content ..\demo-repo\hello.txt "hello from aura"
 New-Item -ItemType Directory ..\demo-repo\src -Force
 Set-Content ..\demo-repo\src\lib.txt "demo source"
 
-aura --repo ..\demo-repo add hello.txt src
-aura --repo ..\demo-repo status
-aura --repo ..\demo-repo commit initial snapshot
-aura --repo ..\demo-repo branch feature
-aura --repo ..\demo-repo checkout feature
-aura --repo ..\demo-repo log
-aura --repo ..\demo-repo diff
+aura -C ..\demo-repo add -A
+aura -C ..\demo-repo status
+aura -C ..\demo-repo commit -m initial snapshot
+aura -C ..\demo-repo push
+aura -C ..\demo-repo branch feature
+aura -C ..\demo-repo switch feature
+aura -C ..\demo-repo log
+aura -C ..\demo-repo diff
+```
+
+Работа из вложенной папки репозитория:
+
+```powershell
+cd ..\demo-repo\src
+
+Set-Content .\nested.txt "from nested dir"
+aura add nested.txt
+aura status
+aura commit -m "add nested file"
+```
+
+Локальный remote и push:
+
+```powershell
+aura remote add origin ..\demo-remote
+aura push
+aura push main
+aura push origin main
 ```
 
 ## Smoke Проверка

@@ -27,15 +27,26 @@ pub fn heads_dir(repo_path: &Path) -> PathBuf {
     repo_path.join(AURA_DIR).join("refs").join("heads")
 }
 
+/// Returns the path to `.aura/remotes`.
+pub fn remotes_dir(repo_path: &Path) -> PathBuf {
+    repo_path.join(AURA_DIR).join("remotes")
+}
+
 /// Returns the full path of a branch reference file.
 pub fn branch_path(repo_path: &Path, branch: &str) -> PathBuf {
     heads_dir(repo_path).join(branch)
+}
+
+/// Returns the full path of a remote definition file.
+pub fn remote_path(repo_path: &Path, remote: &str) -> PathBuf {
+    remotes_dir(repo_path).join(remote)
 }
 
 /// Creates the reference directory layout used by Aura.
 pub async fn ensure_layout(fs: &dyn FileSystem, repo_path: &Path) -> Result<()> {
     fs.create_dir_all(&repo_path.join(AURA_DIR).join("objects")).await?;
     fs.create_dir_all(&heads_dir(repo_path)).await?;
+    fs.create_dir_all(&remotes_dir(repo_path)).await?;
     Ok(())
 }
 
@@ -117,6 +128,40 @@ pub async fn write_branch(
         fs.create_dir_all(parent).await?;
     }
     fs.write(&path, format!("{oid}\n").as_bytes()).await
+}
+
+/// Reads a configured remote path.
+pub async fn read_remote(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    remote: &str,
+) -> Result<Option<String>> {
+    let path = remote_path(repo_path, remote);
+    if !fs.exists(&path).await? {
+        return Ok(None);
+    }
+
+    let target = fs.read_to_string(&path).await?;
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Writes a remote configuration entry.
+pub async fn write_remote(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    remote: &str,
+    target: &str,
+) -> Result<()> {
+    let path = remote_path(repo_path, remote);
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent).await?;
+    }
+    fs.write(&path, format!("{target}\n").as_bytes()).await
 }
 
 /// Resolves a reference such as `refs/heads/main` to a commit id.

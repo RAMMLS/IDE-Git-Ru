@@ -68,6 +68,19 @@ pub struct RepositoryStatus {
     pub untracked: Vec<PathBuf>,
 }
 
+/// Result returned by [`Repository::push`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushSummary {
+    /// Remote name used for the push.
+    pub remote: String,
+    /// Branch name updated on the remote side.
+    pub branch: String,
+    /// Commit id written to the remote branch.
+    pub oid: String,
+    /// Target repository path for the remote.
+    pub target: PathBuf,
+}
+
 /// One line in a line-oriented diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
@@ -189,6 +202,43 @@ impl Repository {
         Ok(written)
     }
 
+    /// Adds the full working tree to the index and stages deletions.
+    pub async fn add_all(&self) -> Result<Vec<String>> {
+        self.ensure_initialized().await?;
+
+        let mut stack = vec![self.path.clone()];
+        let mut index_file = IndexFile::default();
+        let mut written = Vec::new();
+
+        while let Some(directory) = stack.pop() {
+            for child in self.fs.read_dir(&directory).await? {
+                if is_aura_dir(&child) {
+                    continue;
+                }
+
+                let metadata = self.fs.metadata(&child).await?;
+                if metadata.is_dir {
+                    stack.push(child);
+                    continue;
+                }
+
+                if !metadata.is_file {
+                    continue;
+                }
+
+                let relative = self.repo_relative(&child)?;
+                let bytes = self.fs.read(&child).await?;
+                let oid = object::write_blob(self.fs.as_ref(), &self.path, &Blob::new(bytes)).await?;
+                let entry = index::entry_from_metadata(relative, FILE_MODE_INDEX, oid.clone(), &metadata);
+                index_file.upsert(entry);
+                written.push(oid);
+            }
+        }
+
+        index::save_index(self.fs.as_ref(), &self.path, &index_file).await?;
+        Ok(written)
+    }
+
     /// Creates a commit from the current index and updates the active reference.
     pub async fn commit(&self, message: impl Into<String>) -> Result<String> {
         self.ensure_initialized().await?;
@@ -260,6 +310,58 @@ impl Repository {
             .await?
             .ok_or_else(|| AuraError::ReferenceNotFound("HEAD".to_string()))?;
         refs::write_branch(self.fs.as_ref(), &self.path, name, &head).await
+    }
+
+    /// Configures a named remote that currently points to another local Aura repository.
+    pub async fn add_remote(&self, name: &str, target: impl Into<PathBuf>) -> Result<PathBuf> {
+        self.ensure_initialized().await?;
+
+        let target = target.into();
+        refs::write_remote(
+            self.fs.as_ref(),
+            &self.path,
+            name,
+            &target.to_string_lossy(),
+        )
+        .await?;
+        Ok(target)
+    }
+
+    /// Pushes the requested branch to a named remote.
+    pub async fn push(&self, remote: Option<&str>, branch: Option<&str>) -> Result<PushSummary> {
+        self.ensure_initialized().await?;
+
+        let remote_name = remote.unwrap_or("origin").to_string();
+        let branch_name = match branch {
+            Some(value) => value.to_string(),
+            None => refs::current_branch(self.fs.as_ref(), &self.path)
+                .await?
+                .ok_or(AuraError::DetachedHead)?,
+        };
+
+        let oid = refs::read_branch(self.fs.as_ref(), &self.path, &branch_name)
+            .await?
+            .ok_or_else(|| AuraError::BranchNotFound(branch_name.clone()))?;
+        let remote_target = refs::read_remote(self.fs.as_ref(), &self.path, &remote_name)
+            .await?
+            .ok_or_else(|| AuraError::RemoteNotFound(remote_name.clone()))?;
+        let target = PathBuf::from(remote_target);
+
+        let remote_repo = Repository::with_fs(target.clone(), self.fs.clone());
+        if !self.fs.exists(&remote_repo.aura_dir()).await? {
+            remote_repo.init_repository().await?;
+        }
+
+        let mut copied = BTreeSet::new();
+        self.copy_commit_to(&remote_repo, &oid, &mut copied).await?;
+        refs::write_branch(remote_repo.fs.as_ref(), &remote_repo.path, &branch_name, &oid).await?;
+
+        Ok(PushSummary {
+            remote: remote_name,
+            branch: branch_name,
+            oid,
+            target,
+        })
     }
 
     /// Switches the working tree to the requested branch.
@@ -476,6 +578,68 @@ impl Repository {
         }
 
         Ok(entries)
+    }
+
+    #[async_recursion]
+    async fn copy_commit_to(
+        &self,
+        destination: &Repository,
+        oid: &str,
+        copied: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !copied.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+        object::write_commit(destination.fs.as_ref(), &destination.path, &commit).await?;
+        self.copy_tree_to(destination, &commit.tree, copied).await?;
+
+        for parent in &commit.parents {
+            self.copy_commit_to(destination, parent, copied).await?;
+        }
+
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn copy_tree_to(
+        &self,
+        destination: &Repository,
+        oid: &str,
+        copied: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !copied.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let tree = object::read_tree(self.fs.as_ref(), &self.path, oid).await?;
+        object::write_tree(destination.fs.as_ref(), &destination.path, &tree).await?;
+
+        for entry in tree.entries {
+            if entry.mode == DIRECTORY_MODE_TREE {
+                self.copy_tree_to(destination, &entry.oid, copied).await?;
+            } else {
+                self.copy_blob_to(destination, &entry.oid, copied).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn copy_blob_to(
+        &self,
+        destination: &Repository,
+        oid: &str,
+        copied: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !copied.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let blob = object::read_blob(self.fs.as_ref(), &self.path, oid).await?;
+        object::write_blob(destination.fs.as_ref(), &destination.path, &blob).await?;
+        Ok(())
     }
 
     async fn collect_worktree_oids(&self) -> Result<BTreeMap<String, String>> {

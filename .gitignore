@@ -1,27 +1,18 @@
-# Rust build artifacts
+# Папка сборки — здесь компилятор генерирует все артефакты.
+# Она может весить гигабайты, её никогда не коммитят.
 target/
-**/target/
 
-# Cargo
-Cargo.lock
+# Файлы блокировки пакетного менеджера (если бы ты использовал его).
+# Cargo.lock для приложений обычно коммитят, но если хочешь — добавь.
+# Cargo.lock
 
-# Aura repositories and demo worktrees
-.aura/
-demo-repo/
-aura-demo-repo/
-my-aura-demo/
-
-# IDE and editor files
-.vscode/
-.idea/
-*.code-workspace
-
-# OS files
+# Временные файлы редакторов и ОС
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
-Desktop.ini
 
-# Logs and temporary files
-*.log
-*.tmp
-*.temp
+# Файлы среды разработки (если используешь VS Code, но не хочешь папку .vscode)
+# .vscode/
+

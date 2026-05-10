@@ -3,6 +3,7 @@ mod core;
 mod view;
 
 
+use std::path::PathBuf;
 use iced::widget::text_editor;
 use iced::{executor, Application, Command, Element, Settings, Theme};
 
@@ -23,7 +24,16 @@ pub enum Message {
     // Сохранение
     SaveFiles,
 
+    // Название файла
     SetNewFileName(String),
+
+    // Добавляем сообщение 
+    RefreshFileTree,
+    
+
+    // Раскрытие директорий в дереве
+    ToggleDir(PathBuf),
+
 }
 
 // Реализация логики Iced для нашей структуры
@@ -55,10 +65,33 @@ impl Application for MyIde {
     // Обновление состояния (реакция на Message)
     fn update(&mut self, message: Message) -> Command<Message> {
     match message {
+
+
+        Message::ToggleDir(dir_path) => {
+            if self.state.expanded_dirs.contains(&dir_path) {
+                self.state.expanded_dirs.remove(&dir_path);
+            } else {
+                self.state.expanded_dirs.insert(dir_path);
+            }
+        }
         Message::EditorAction(action) => {
             self.content.perform(action);
             self.state.is_dirty = true;
         }
+
+
+        Message::RefreshFileTree => {
+            match core::filesystem::ListFilesInDir(&self.state.db_dir) {
+                Ok(files) => {
+                    self.state.file_tree = files;
+                }
+
+                Err(e) => {
+                    eprintln!("Ошибка чтения папки db: {}", e);
+                }
+            }
+        }
+
 
         Message::CreateNewFile(dir, filename) => {
             match core::filesystem::CreateFileInDir(&dir, &filename) {
@@ -66,6 +99,12 @@ impl Application for MyIde {
                     self.state.current_file = Some(path);
                     self.content = text_editor::Content::new();
                     self.state.is_dirty = false;
+
+                    self.state.file_tree = core::filesystem::ListFilesInDir(&self.state.db_dir)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Ошибка обновления дерева: {}", e);
+                            Vec::new()
+                        });
                 }
                 Err(e) => {
                     eprintln!("Не удалось создать файл: {}", e);

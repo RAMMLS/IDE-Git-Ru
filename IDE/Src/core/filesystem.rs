@@ -24,3 +24,17 @@ pub fn CreateFileInDir(dir: &Path, filename: &str) -> Result<PathBuf, std::io::E
 pub fn SaveFiles(path: &Path, content: &str) -> Result<(), std::io::Error> {
     std::fs::write(path, content)
 }
+
+pub fn ListFilesInDir(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        entries.push(PathBuf::from(file_name));
+    }
+    Ok(entries)
+}
+
+pub fn is_dir(path: &Path) -> bool {
+    path.is_dir() 
+}

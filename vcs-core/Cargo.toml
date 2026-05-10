@@ -5,6 +5,10 @@ edition = "2021"
 description = "Core version control primitives for the Aura project"
 license = "MIT"
 
+[[bin]]
+name = "aura"
+path = "src/main.rs"
+
 [dependencies]
 async-recursion = "1.1"
 async-trait = "0.1"

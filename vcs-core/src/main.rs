@@ -185,7 +185,7 @@ fn print_usage() {
     println!("Aura Control CLI");
     println!();
     println!("Usage:");
-    println!("  cargo run -- [--repo PATH] <command> [args]");
+    println!("  aura [--repo PATH] <command> [args]");
     println!();
     println!("Commands:");
     println!("  init [PATH]          Initialize a new Aura repository");
@@ -199,12 +199,12 @@ fn print_usage() {
     println!("  help                 Show this help");
     println!();
     println!("Examples:");
-    println!("  cargo run -- init ..\\demo-repo");
-    println!("  cargo run -- --repo ..\\demo-repo add hello.txt src");
-    println!("  cargo run -- --repo ..\\demo-repo commit initial snapshot");
-    println!("  cargo run -- --repo ..\\demo-repo status");
-    println!("  cargo run -- --repo ..\\demo-repo branch feature");
-    println!("  cargo run -- --repo ..\\demo-repo checkout feature");
+    println!("  aura init ..\\demo-repo");
+    println!("  aura --repo ..\\demo-repo add hello.txt src");
+    println!("  aura --repo ..\\demo-repo commit initial snapshot");
+    println!("  aura --repo ..\\demo-repo status");
+    println!("  aura --repo ..\\demo-repo branch feature");
+    println!("  aura --repo ..\\demo-repo checkout feature");
 }
 
 fn print_status(title: &str, status: &aura_control::RepositoryStatus) {

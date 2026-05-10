@@ -74,10 +74,29 @@ cd C:\Users\RAMMLS\Desktop\IDE-Git-Ru\vcs-core
 cargo check
 ```
 
+Установи CLI-команду `aura` одной командой:
+
+```powershell
+.\install-aura.bat
+```
+
+Скрипт:
+
+- проверяет наличие `cargo`;
+- при необходимости ставит Rust через `winget`;
+- добавляет `%USERPROFILE%\.cargo\bin` в пользовательский `PATH`;
+- устанавливает локальный бинарник `aura`.
+
+Ручной вариант установки:
+
+```powershell
+cargo install --path .\vcs-core --bin aura --force
+```
+
 Покажи встроенную справку CLI:
 
 ```powershell
-cargo run -- help
+aura help
 ```
 
 ## CLI
@@ -87,7 +106,7 @@ cargo run -- help
 Общий формат:
 
 ```powershell
-cargo run -- [--repo PATH] <command> [args]
+aura [--repo PATH] <command> [args]
 ```
 
 Доступные команды:
@@ -104,19 +123,19 @@ cargo run -- [--repo PATH] <command> [args]
 Примеры:
 
 ```powershell
-cargo run -- init ..\demo-repo
+aura init ..\demo-repo
 
 Set-Content ..\demo-repo\hello.txt "hello from aura"
 New-Item -ItemType Directory ..\demo-repo\src -Force
 Set-Content ..\demo-repo\src\lib.txt "demo source"
 
-cargo run -- --repo ..\demo-repo add hello.txt src
-cargo run -- --repo ..\demo-repo status
-cargo run -- --repo ..\demo-repo commit initial snapshot
-cargo run -- --repo ..\demo-repo branch feature
-cargo run -- --repo ..\demo-repo checkout feature
-cargo run -- --repo ..\demo-repo log
-cargo run -- --repo ..\demo-repo diff
+aura --repo ..\demo-repo add hello.txt src
+aura --repo ..\demo-repo status
+aura --repo ..\demo-repo commit initial snapshot
+aura --repo ..\demo-repo branch feature
+aura --repo ..\demo-repo checkout feature
+aura --repo ..\demo-repo log
+aura --repo ..\demo-repo diff
 ```
 
 ## Smoke Проверка

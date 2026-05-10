@@ -19,7 +19,8 @@ pub mod refs;
 mod repository;
 
 pub use repository::{
-    ChangeKind, CommitSummary, DiffLine, FileDiff, PushSummary, RepositoryStatus, StatusEntry,
+    ChangeKind, ChangeStats, CommitOutcome, CommitSummary, DiffLine, FileChangeStat, FileDiff,
+    PullStatus, PullSummary, PushSummary, RepositoryStatus, StatusEntry,
 };
 
 /// Name of the metadata directory used by Aura repositories.
@@ -89,6 +90,28 @@ pub enum AuraError {
     /// A remote could not be located.
     #[error("remote `{0}` does not exist")]
     RemoteNotFound(String),
+    /// A remote branch could not be located.
+    #[error("remote branch `{remote}/{branch}` does not exist")]
+    RemoteBranchNotFound {
+        /// Remote name.
+        remote: String,
+        /// Branch name.
+        branch: String,
+    },
+    /// Pull cannot proceed because the local branch diverged from the remote branch.
+    #[error("cannot fast-forward local branch `{local}` from `{remote}`")]
+    DivergedBranches {
+        /// Local branch name.
+        local: String,
+        /// Remote branch identifier.
+        remote: String,
+    },
+    /// Checkout or pull cannot proceed while staged or unstaged tracked changes are present.
+    #[error("working tree has staged or unstaged changes; commit or stash them before switching branches or pulling")]
+    WorkingTreeNotClean,
+    /// Checkout or pull would overwrite an untracked path in the working tree.
+    #[error("operation would overwrite untracked path `{0}`")]
+    UntrackedWouldBeOverwritten(String),
 }
 
 /// Timestamp captured from the backing filesystem.

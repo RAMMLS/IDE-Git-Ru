@@ -141,7 +141,9 @@ CLI теперь ближе к привычному сценарию `git`:
 - `aura add -A` индексирует всё рабочее дерево и stage-ит удаления;
 - `-C PATH` позволяет работать с репозиторием, не переходя в него;
 - `aura commit -m "message"` поддерживается как основной способ задания сообщения;
+- `aura commit` теперь печатает git-подобный summary со short SHA и `file changed` / `insertion(+)` / `deletion(-)`;
 - `aura push` и `aura push origin <branch>` работают через локальные именованные remotes;
+- `aura pull`, `aura pull origin` и `aura pull origin <branch>` подтягивают изменения из remote в текущую ветку через fast-forward;
 - `aura switch <branch>` доступна как более понятный алиас для `aura checkout <branch>`.
 
 Поддержанные команды:
@@ -156,6 +158,8 @@ CLI теперь ближе к привычному сценарию `git`:
 - `remote add <NAME> <PATH>`
 - `push [REMOTE] [BRANCH]`
   при одном аргументе, совпадающем с локальной веткой, команда трактуется как `push origin <BRANCH>`
+- `pull [REMOTE] [BRANCH]`
+  по умолчанию тянет из `origin` в текущую ветку; сейчас поддержан fast-forward сценарий без auto-merge
 - `checkout <NAME>`
 - `switch <NAME>`
 - `diff`
@@ -175,6 +179,7 @@ aura -C ..\demo-repo add -A
 aura -C ..\demo-repo status
 aura -C ..\demo-repo commit -m initial snapshot
 aura -C ..\demo-repo push
+aura -C ..\demo-repo pull
 aura -C ..\demo-repo branch feature
 aura -C ..\demo-repo switch feature
 aura -C ..\demo-repo log
@@ -198,6 +203,9 @@ aura remote add origin ..\demo-remote
 aura push
 aura push main
 aura push origin main
+aura pull
+aura pull origin
+aura pull origin main
 ```
 
 ## Smoke Проверка
@@ -234,6 +242,8 @@ Smoke-сценарий автоматически:
 - автор и коммитер фиксированы: `Aura User <aura@local>`;
 - время коммита записывается в UTC;
 - `diff` сейчас line-based и использует алгоритм Майерса;
+- `commit` и fast-forward `pull` выводят line-based статистику, близкую к `git diff --stat`;
 - для работы CLI пути в `add` интерпретируются относительно текущей папки или `-C PATH`;
 - текущий `push` синхронизирует только локальные Aura-репозитории по пути, без сети и без HTTP-сервера;
+- `pull` пока не делает merge-коммитов и завершится ошибкой, если локальная и remote ветки разошлись;
 - smoke-пример по-прежнему запускается через `cargo run --example smoke`.

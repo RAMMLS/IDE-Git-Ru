@@ -49,6 +49,7 @@ Aura хранит объекты по модели, близкой к Git:
 - `init`
 - `add`
 - `commit`
+- `pull`
 - `push`
 - `status`
 - `log`
@@ -125,7 +126,9 @@ aura [-C PATH | --repo PATH] <command> [args]
 - `aura add -A` индексирует всё рабочее дерево и одновременно stage-ит удаления;
 - `-C PATH` и `--repo PATH` позволяют работать с репозиторием, не переходя в него;
 - `aura commit -m "message"` поддерживается как основной способ задания сообщения;
-- `aura push` и `aura push origin <branch>` пока работают с локальными Aura-репозиториями через именованные remotes.
+- `aura commit` теперь печатает git-подобный summary со short SHA и line-based статистикой изменений;
+- `aura push` и `aura push origin <branch>` работают с локальными Aura-репозиториями через именованные remotes;
+- `aura pull`, `aura pull origin` и `aura pull origin <branch>` подтягивают изменения из remote в текущую ветку через fast-forward.
 
 Доступные команды:
 
@@ -139,6 +142,8 @@ aura [-C PATH | --repo PATH] <command> [args]
 - `remote add <NAME> <PATH>` - настраивает локальный remote-репозиторий;
 - `push [REMOTE] [BRANCH]` - пушит текущую или указанную ветку в remote;
   если передан один аргумент и это локальная ветка, Aura трактует команду как `push origin <BRANCH>`;
+- `pull [REMOTE] [BRANCH]` - подтягивает изменения из remote в текущую ветку;
+  по умолчанию использует `origin` и поддерживает fast-forward без auto-merge;
 - `checkout <NAME>` - переключает рабочее дерево на ветку;
 - `switch <NAME>` - алиас для `checkout`;
 - `diff` - показывает diff рабочей директории относительно индекса.
@@ -158,6 +163,7 @@ aura -C ..\demo-repo add -A
 aura -C ..\demo-repo status
 aura -C ..\demo-repo commit -m initial snapshot
 aura -C ..\demo-repo push
+aura -C ..\demo-repo pull
 aura -C ..\demo-repo branch feature
 aura -C ..\demo-repo switch feature
 aura -C ..\demo-repo log
@@ -182,6 +188,9 @@ aura remote add origin ..\demo-remote
 aura push
 aura push main
 aura push origin main
+aura pull
+aura pull origin
+aura pull origin main
 ```
 
 ## Smoke Проверка

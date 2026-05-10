@@ -81,6 +81,75 @@ pub struct PushSummary {
     pub target: PathBuf,
 }
 
+/// Per-file line statistics for a tree-to-tree change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChangeStat {
+    /// Repository-relative file path.
+    pub path: PathBuf,
+    /// Change kind for the file.
+    pub kind: ChangeKind,
+    /// Number of added lines.
+    pub insertions: usize,
+    /// Number of removed lines.
+    pub deletions: usize,
+}
+
+/// Aggregate line statistics for a tree-to-tree change.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangeStats {
+    /// Number of paths that changed.
+    pub files_changed: usize,
+    /// Number of added lines across all changed files.
+    pub insertions: usize,
+    /// Number of removed lines across all changed files.
+    pub deletions: usize,
+    /// Per-file statistics sorted by path.
+    pub files: Vec<FileChangeStat>,
+}
+
+/// Summary returned by [`Repository::commit_with_summary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// Commit id.
+    pub oid: String,
+    /// Active branch name when `HEAD` is symbolic.
+    pub branch: Option<String>,
+    /// Commit message used for the new commit.
+    pub message: String,
+    /// Diff statistics between the parent commit and the new commit.
+    pub stats: ChangeStats,
+}
+
+/// Result mode returned by [`Repository::pull`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullStatus {
+    /// Local branch already contains the requested remote commit.
+    AlreadyUpToDate,
+    /// Local branch was advanced to the remote commit without a merge commit.
+    FastForward,
+}
+
+/// Summary returned by [`Repository::pull`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSummary {
+    /// Remote name used for the pull.
+    pub remote: String,
+    /// Remote branch used as the pull source.
+    pub source_branch: String,
+    /// Local branch that received the update.
+    pub local_branch: String,
+    /// Commit id written or confirmed locally.
+    pub oid: String,
+    /// Local branch tip before the pull, when it existed.
+    pub previous_oid: Option<String>,
+    /// Pull result mode.
+    pub status: PullStatus,
+    /// Diff statistics for a fast-forward update.
+    pub stats: Option<ChangeStats>,
+    /// Source repository path for the remote.
+    pub target: PathBuf,
+}
+
 /// One line in a line-oriented diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
@@ -241,20 +310,34 @@ impl Repository {
 
     /// Creates a commit from the current index and updates the active reference.
     pub async fn commit(&self, message: impl Into<String>) -> Result<String> {
+        Ok(self.commit_with_summary(message).await?.oid)
+    }
+
+    /// Creates a commit and returns a Git-like summary for CLI output.
+    pub async fn commit_with_summary(&self, message: impl Into<String>) -> Result<CommitOutcome> {
         self.ensure_initialized().await?;
 
+        let branch = refs::current_branch(self.fs.as_ref(), &self.path).await?;
         let index_file = index::load_index(self.fs.as_ref(), &self.path).await?;
         let tree_oid = self.write_tree_from_index(&index_file).await?;
         let timestamp = Utc::now().timestamp();
         let parent = refs::resolve_head(self.fs.as_ref(), &self.path).await?;
+        let message = message.into();
         let commit = Commit {
             tree: tree_oid,
             parents: parent.into_iter().collect(),
             author: DEFAULT_AUTHOR.to_string(),
             committer: DEFAULT_AUTHOR.to_string(),
             timestamp,
-            message: message.into(),
+            message,
         };
+        let parent_tree = match commit.parents.first() {
+            Some(parent_oid) => Some(object::read_commit(self.fs.as_ref(), &self.path, parent_oid).await?.tree),
+            None => None,
+        };
+        let stats = self
+            .diff_stats_between_trees(parent_tree.as_deref(), Some(commit.tree.as_str()))
+            .await?;
 
         let oid = object::write_commit(self.fs.as_ref(), &self.path, &commit).await?;
         match refs::read_head(self.fs.as_ref(), &self.path).await? {
@@ -269,7 +352,12 @@ impl Repository {
             }
         }
 
-        Ok(oid)
+        Ok(CommitOutcome {
+            oid,
+            branch,
+            message: commit.message,
+            stats,
+        })
     }
 
     /// Returns the commit history by following the first parent chain from `HEAD`.
@@ -364,6 +452,106 @@ impl Repository {
         })
     }
 
+    /// Pulls a remote branch into the current local branch using fast-forward semantics.
+    pub async fn pull(&self, remote: Option<&str>, branch: Option<&str>) -> Result<PullSummary> {
+        self.ensure_initialized().await?;
+
+        let local_branch = refs::current_branch(self.fs.as_ref(), &self.path)
+            .await?
+            .ok_or(AuraError::DetachedHead)?;
+        let remote_name = remote.unwrap_or("origin").to_string();
+        let source_branch = branch.unwrap_or(local_branch.as_str()).to_string();
+        let remote_target = refs::read_remote(self.fs.as_ref(), &self.path, &remote_name)
+            .await?
+            .ok_or_else(|| AuraError::RemoteNotFound(remote_name.clone()))?;
+        let remote_path = PathBuf::from(remote_target);
+        let remote_repo = Repository::with_fs(remote_path.clone(), self.fs.clone());
+        if !self.fs.exists(&remote_repo.aura_dir()).await? {
+            return Err(AuraError::NotRepository(remote_path.display().to_string()));
+        }
+
+        let remote_oid = refs::read_branch(remote_repo.fs.as_ref(), &remote_repo.path, &source_branch)
+            .await?
+            .ok_or_else(|| AuraError::RemoteBranchNotFound {
+                remote: remote_name.clone(),
+                branch: source_branch.clone(),
+            })?;
+
+        let mut copied = BTreeSet::new();
+        remote_repo.copy_commit_to(self, &remote_oid, &mut copied).await?;
+        refs::write_remote_branch(
+            self.fs.as_ref(),
+            &self.path,
+            &remote_name,
+            &source_branch,
+            &remote_oid,
+        )
+        .await?;
+
+        let previous_oid = refs::read_branch(self.fs.as_ref(), &self.path, &local_branch).await?;
+        if previous_oid.as_deref() == Some(remote_oid.as_str()) {
+            return Ok(PullSummary {
+                remote: remote_name,
+                source_branch,
+                local_branch,
+                oid: remote_oid,
+                previous_oid,
+                status: PullStatus::AlreadyUpToDate,
+                stats: None,
+                target: remote_path,
+            });
+        }
+
+        if let Some(local_oid) = previous_oid.as_deref() {
+            if self.is_ancestor(&remote_oid, local_oid).await? {
+                return Ok(PullSummary {
+                    remote: remote_name,
+                    source_branch,
+                    local_branch,
+                    oid: local_oid.to_string(),
+                    previous_oid,
+                    status: PullStatus::AlreadyUpToDate,
+                    stats: None,
+                    target: remote_path,
+                });
+            }
+
+            if !self.is_ancestor(local_oid, &remote_oid).await? {
+                return Err(AuraError::DivergedBranches {
+                    local: local_branch,
+                    remote: format!("{remote_name}/{source_branch}"),
+                });
+            }
+        }
+
+        let current = match previous_oid.as_deref() {
+            Some(oid) => {
+                let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+                self.collect_tree_entries(&commit.tree).await?
+            }
+            None => BTreeMap::new(),
+        };
+        let target_commit = object::read_commit(self.fs.as_ref(), &self.path, &remote_oid).await?;
+        let target_map = self.collect_tree_entries(&target_commit.tree).await?;
+        self.ensure_worktree_can_apply_target(&current, &target_map).await?;
+        let stats = self
+            .diff_stats_between_commits(previous_oid.as_deref(), Some(remote_oid.as_str()))
+            .await?;
+        self.apply_snapshot_to_worktree(&current, &target_map).await?;
+        refs::write_branch(self.fs.as_ref(), &self.path, &local_branch, &remote_oid).await?;
+
+        Ok(PullSummary {
+            remote: remote_name,
+            source_branch,
+            local_branch,
+            oid: remote_oid,
+            previous_oid,
+            status: PullStatus::FastForward,
+            stats: Some(stats),
+            target: remote_path,
+        })
+    }
+
     /// Switches the working tree to the requested branch.
     ///
     /// Aura checks out the branch tree into the worktree and rewrites the index
@@ -378,31 +566,16 @@ impl Repository {
             .ok_or_else(|| AuraError::BranchNotFound(branch.to_string()))?;
         let commit = object::read_commit(self.fs.as_ref(), &self.path, &commit_oid).await?;
         let target = self.collect_tree_entries(&commit.tree).await?;
-        let current_index = index::load_index(self.fs.as_ref(), &self.path).await?;
-
-        for entry in &current_index.entries {
-            if target.contains_key(&entry.path) {
-                continue;
+        let current_head = refs::resolve_head(self.fs.as_ref(), &self.path).await?;
+        let current = match current_head.as_deref() {
+            Some(oid) => {
+                let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+                self.collect_tree_entries(&commit.tree).await?
             }
-            let path = self.path.join(repo_path_to_native(&entry.path));
-            self.fs.remove_file(&path).await?;
-        }
-
-        let mut new_index = IndexFile::default();
-        for (path, oid) in target {
-            let absolute = self.path.join(repo_path_to_native(&path));
-            if let Some(parent) = absolute.parent() {
-                self.fs.create_dir_all(parent).await?;
-            }
-
-            let blob = object::read_blob(self.fs.as_ref(), &self.path, &oid).await?;
-            self.fs.write(&absolute, &blob.content).await?;
-            let metadata = self.fs.metadata(&absolute).await?;
-            let entry = index::entry_from_metadata(path, FILE_MODE_INDEX, oid, &metadata);
-            new_index.upsert(entry);
-        }
-
-        index::save_index(self.fs.as_ref(), &self.path, &new_index).await?;
+            None => BTreeMap::new(),
+        };
+        self.ensure_worktree_can_apply_target(&current, &target).await?;
+        self.apply_snapshot_to_worktree(&current, &target).await?;
         refs::set_head_to_branch(self.fs.as_ref(), &self.path, branch).await
     }
 
@@ -424,7 +597,7 @@ impl Repository {
         let worktree_map = self.collect_worktree_oids().await?;
 
         let staged = compare_maps(&head_map, &index_map);
-        let unstaged = compare_maps(&index_map, &worktree_map);
+        let unstaged = compare_tracked_maps(&index_map, &worktree_map);
         let untracked = worktree_map
             .keys()
             .filter(|path| !index_map.contains_key(*path))
@@ -669,6 +842,149 @@ impl Repository {
 
         Ok(files)
     }
+
+    async fn diff_stats_between_commits(
+        &self,
+        base_commit: Option<&str>,
+        target_commit: Option<&str>,
+    ) -> Result<ChangeStats> {
+        let base_tree = match base_commit {
+            Some(oid) => Some(object::read_commit(self.fs.as_ref(), &self.path, oid).await?.tree),
+            None => None,
+        };
+        let target_tree = match target_commit {
+            Some(oid) => Some(object::read_commit(self.fs.as_ref(), &self.path, oid).await?.tree),
+            None => None,
+        };
+        self.diff_stats_between_trees(base_tree.as_deref(), target_tree.as_deref())
+            .await
+    }
+
+    async fn diff_stats_between_trees(
+        &self,
+        base_tree: Option<&str>,
+        target_tree: Option<&str>,
+    ) -> Result<ChangeStats> {
+        let base = match base_tree {
+            Some(oid) => self.collect_tree_entries(oid).await?,
+            None => BTreeMap::new(),
+        };
+        let target = match target_tree {
+            Some(oid) => self.collect_tree_entries(oid).await?,
+            None => BTreeMap::new(),
+        };
+        self.diff_stats_between_maps(&base, &target).await
+    }
+
+    async fn diff_stats_between_maps(
+        &self,
+        base: &BTreeMap<String, String>,
+        target: &BTreeMap<String, String>,
+    ) -> Result<ChangeStats> {
+        let mut paths = BTreeSet::new();
+        paths.extend(base.keys().cloned());
+        paths.extend(target.keys().cloned());
+
+        let mut stats = ChangeStats::default();
+        for path in paths {
+            let kind = match (base.get(&path), target.get(&path)) {
+                (Some(left), Some(right)) if left == right => continue,
+                (None, Some(_)) => ChangeKind::Added,
+                (Some(_), None) => ChangeKind::Deleted,
+                (Some(_), Some(_)) => ChangeKind::Modified,
+                (None, None) => continue,
+            };
+            let old_bytes = match base.get(&path) {
+                Some(oid) => object::read_blob(self.fs.as_ref(), &self.path, oid).await?.content,
+                None => Vec::new(),
+            };
+            let new_bytes = match target.get(&path) {
+                Some(oid) => object::read_blob(self.fs.as_ref(), &self.path, oid).await?.content,
+                None => Vec::new(),
+            };
+            let (insertions, deletions) = line_change_counts(&old_bytes, &new_bytes);
+            stats.files_changed += 1;
+            stats.insertions += insertions;
+            stats.deletions += deletions;
+            stats.files.push(FileChangeStat {
+                path: repo_path_to_native(&path),
+                kind,
+                insertions,
+                deletions,
+            });
+        }
+
+        Ok(stats)
+    }
+
+    async fn ensure_worktree_can_apply_target(
+        &self,
+        current: &BTreeMap<String, String>,
+        target: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let status = self.status().await?;
+        if !status.staged.is_empty() || !status.unstaged.is_empty() {
+            return Err(AuraError::WorkingTreeNotClean);
+        }
+
+        let worktree_map = self.collect_worktree_oids().await?;
+
+        for path in target.keys() {
+            if !current.contains_key(path) && worktree_map.contains_key(path) {
+                return Err(AuraError::UntrackedWouldBeOverwritten(
+                    repo_path_to_native(path).display().to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn apply_snapshot_to_worktree(
+        &self,
+        current: &BTreeMap<String, String>,
+        target: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        for path in current.keys() {
+            if target.contains_key(path) {
+                continue;
+            }
+            let absolute = self.path.join(repo_path_to_native(path));
+            self.fs.remove_file(&absolute).await?;
+        }
+
+        let mut new_index = IndexFile::default();
+        for (path, oid) in target {
+            let absolute = self.path.join(repo_path_to_native(path));
+            if let Some(parent) = absolute.parent() {
+                self.fs.create_dir_all(parent).await?;
+            }
+
+            let blob = object::read_blob(self.fs.as_ref(), &self.path, oid).await?;
+            self.fs.write(&absolute, &blob.content).await?;
+            let metadata = self.fs.metadata(&absolute).await?;
+            let entry = index::entry_from_metadata(path.clone(), FILE_MODE_INDEX, oid.clone(), &metadata);
+            new_index.upsert(entry);
+        }
+
+        index::save_index(self.fs.as_ref(), &self.path, &new_index).await
+    }
+
+    #[async_recursion]
+    async fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        if ancestor == descendant {
+            return Ok(true);
+        }
+
+        let commit = object::read_commit(self.fs.as_ref(), &self.path, descendant).await?;
+        for parent in &commit.parents {
+            if self.is_ancestor(ancestor, parent).await? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 fn index_to_map(index: &IndexFile) -> BTreeMap<String, String> {
@@ -697,6 +1013,27 @@ fn compare_maps(base: &BTreeMap<String, String>, target: &BTreeMap<String, Strin
             }),
             (Some(left), Some(right)) if left != right => result.push(StatusEntry {
                 path: repo_path_to_native(&path),
+                kind: ChangeKind::Modified,
+            }),
+            _ => {}
+        }
+    }
+    result
+}
+
+fn compare_tracked_maps(
+    base: &BTreeMap<String, String>,
+    target: &BTreeMap<String, String>,
+) -> Vec<StatusEntry> {
+    let mut result = Vec::new();
+    for path in base.keys() {
+        match (base.get(path), target.get(path)) {
+            (Some(_), None) => result.push(StatusEntry {
+                path: repo_path_to_native(path),
+                kind: ChangeKind::Deleted,
+            }),
+            (Some(left), Some(right)) if left != right => result.push(StatusEntry {
+                path: repo_path_to_native(path),
                 kind: ChangeKind::Modified,
             }),
             _ => {}
@@ -739,11 +1076,31 @@ fn split_lines(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn line_change_counts(old_bytes: &[u8], new_bytes: &[u8]) -> (usize, usize) {
+    let old_text = String::from_utf8_lossy(old_bytes).into_owned();
+    let new_text = String::from_utf8_lossy(new_bytes).into_owned();
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+
+    for line in myers_diff(&old_text, &new_text) {
+        match line {
+            DiffLine::Addition(_) => insertions += 1,
+            DiffLine::Deletion(_) => deletions += 1,
+            DiffLine::Context(_) => {}
+        }
+    }
+
+    (insertions, deletions)
+}
+
 fn myers_diff(old: &str, new: &str) -> Vec<DiffLine> {
     let a = split_lines(old);
     let b = split_lines(new);
     let n = a.len() as isize;
     let m = b.len() as isize;
+    if n == 0 && m == 0 {
+        return Vec::new();
+    }
     let max = (n + m) as usize;
     let offset = max as isize;
     let mut v = vec![0isize; 2 * max + 1];
@@ -832,4 +1189,222 @@ fn myers_diff(old: &str, new: &str) -> Vec<DiffLine> {
 
     result.reverse();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PullStatus, Repository};
+    use crate::refs;
+
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aura-{name}-{unique}"))
+    }
+
+    async fn write_file(path: &std::path::Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .expect("parent directory should be created");
+        }
+        tokio::fs::write(path, contents)
+            .await
+            .expect("file should be written");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_summary_reports_line_stats() {
+        let root = temp_repo_path("commit-summary");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        let file = root.join("note.txt");
+        write_file(&file, b"one\n").await;
+        repo.add(["note.txt"]).await.expect("file should be staged");
+        repo.commit("initial commit")
+            .await
+            .expect("initial commit should succeed");
+
+        write_file(&file, b"one\nthree\n").await;
+        repo.add(["note.txt"]).await.expect("updated file should be staged");
+        let summary = repo
+            .commit_with_summary("expand note")
+            .await
+            .expect("commit with summary should succeed");
+
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!(summary.stats.files_changed, 1);
+        assert_eq!(summary.stats.insertions, 1);
+        assert_eq!(summary.stats.deletions, 0);
+        assert_eq!(summary.stats.files.len(), 1);
+        assert_eq!(summary.stats.files[0].insertions, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_fast_forwards_current_branch() {
+        let remote_root = temp_repo_path("pull-remote");
+        let local_root = temp_repo_path("pull-local");
+        let remote = Repository::init(&remote_root)
+            .await
+            .expect("remote repo should init");
+        let local = Repository::init(&local_root)
+            .await
+            .expect("local repo should init");
+
+        write_file(&remote_root.join("hello.txt"), b"from remote\n").await;
+        remote
+            .add(["hello.txt"])
+            .await
+            .expect("remote file should be staged");
+        let remote_commit = remote
+            .commit("remote commit")
+            .await
+            .expect("remote commit should succeed");
+
+        local
+            .add_remote("origin", &remote_root)
+            .await
+            .expect("remote should be configured");
+        let summary = local.pull(None, None).await.expect("pull should succeed");
+
+        assert_eq!(summary.status, PullStatus::FastForward);
+        assert_eq!(summary.oid, remote_commit);
+        assert_eq!(summary.local_branch, "main");
+        assert_eq!(
+            tokio::fs::read_to_string(local_root.join("hello.txt"))
+                .await
+                .expect("local file should exist"),
+            "from remote\n"
+        );
+        assert_eq!(
+            refs::read_branch(local.filesystem(), &local.path, "main")
+                .await
+                .expect("local main should be readable")
+                .as_deref(),
+            Some(remote_commit.as_str())
+        );
+        assert_eq!(summary.stats.expect("fast-forward should include stats").insertions, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkout_restores_target_branch_snapshot() {
+        let root = temp_repo_path("checkout-snapshot");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        write_file(&root.join("main.c"), b"main\n").await;
+        write_file(&root.join("lib.c"), b"lib\n").await;
+        repo.add_all().await.expect("base files should be staged");
+        repo.commit("base commit")
+            .await
+            .expect("base commit should succeed");
+        repo.branch("test").await.expect("test branch should be created");
+
+        repo.checkout("test")
+            .await
+            .expect("checkout test should succeed");
+        write_file(&root.join("test.c"), b"test-only\n").await;
+        repo.add_all()
+            .await
+            .expect("branch-only file should be staged");
+        repo.commit("branch commit")
+            .await
+            .expect("branch commit should succeed");
+        assert!(
+            tokio::fs::try_exists(root.join("test.c"))
+                .await
+                .expect("existence check should succeed")
+        );
+
+        repo.checkout("main")
+            .await
+            .expect("checkout main should succeed");
+        assert!(
+            !tokio::fs::try_exists(root.join("test.c"))
+                .await
+                .expect("existence check should succeed")
+        );
+        assert_eq!(
+            refs::current_branch(repo.filesystem(), &repo.path)
+                .await
+                .expect("current branch should be readable")
+                .as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkout_rejects_conflicting_untracked_file() {
+        let root = temp_repo_path("checkout-untracked");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        write_file(&root.join("base.txt"), b"base\n").await;
+        repo.add_all().await.expect("base file should be staged");
+        repo.commit("base commit")
+            .await
+            .expect("base commit should succeed");
+        repo.branch("test").await.expect("test branch should be created");
+
+        repo.checkout("test")
+            .await
+            .expect("checkout test should succeed");
+        write_file(&root.join("test.c"), b"tracked on test\n").await;
+        repo.add_all()
+            .await
+            .expect("test branch file should be staged");
+        repo.commit("branch commit")
+            .await
+            .expect("branch commit should succeed");
+        repo.checkout("main")
+            .await
+            .expect("checkout main should succeed");
+
+        write_file(&root.join("test.c"), b"local untracked\n").await;
+        let error = repo
+            .checkout("test")
+            .await
+            .expect_err("checkout should reject conflicting untracked file");
+        assert!(matches!(error, crate::AuraError::UntrackedWouldBeOverwritten(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_keeps_untracked_files_out_of_unstaged_changes() {
+        let root = temp_repo_path("status-untracked");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        write_file(&root.join("base.txt"), b"base\n").await;
+        repo.add_all().await.expect("base file should be staged");
+        repo.commit("base commit")
+            .await
+            .expect("base commit should succeed");
+
+        write_file(&root.join("new.txt"), b"untracked\n").await;
+        let status = repo.status().await.expect("status should succeed");
+
+        assert!(status.unstaged.is_empty());
+        assert_eq!(status.untracked.len(), 1);
+        assert_eq!(status.untracked[0], PathBuf::from("new.txt"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_with_empty_file_does_not_panic() {
+        let root = temp_repo_path("commit-empty-file");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        write_file(&root.join("empty.txt"), b"").await;
+        repo.add_all().await.expect("empty file should be staged");
+        let summary = repo
+            .commit_with_summary("empty file commit")
+            .await
+            .expect("commit should succeed");
+
+        assert_eq!(summary.stats.files_changed, 1);
+        assert_eq!(summary.stats.insertions, 0);
+        assert_eq!(summary.stats.deletions, 0);
+        assert_eq!(summary.stats.files.len(), 1);
+    }
 }

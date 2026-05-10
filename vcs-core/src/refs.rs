@@ -32,6 +32,11 @@ pub fn remotes_dir(repo_path: &Path) -> PathBuf {
     repo_path.join(AURA_DIR).join("remotes")
 }
 
+/// Returns the path to `.aura/refs/remotes`.
+pub fn remote_refs_dir(repo_path: &Path) -> PathBuf {
+    repo_path.join(AURA_DIR).join("refs").join("remotes")
+}
+
 /// Returns the full path of a branch reference file.
 pub fn branch_path(repo_path: &Path, branch: &str) -> PathBuf {
     heads_dir(repo_path).join(branch)
@@ -42,10 +47,16 @@ pub fn remote_path(repo_path: &Path, remote: &str) -> PathBuf {
     remotes_dir(repo_path).join(remote)
 }
 
+/// Returns the full path of a remote-tracking branch reference.
+pub fn remote_branch_path(repo_path: &Path, remote: &str, branch: &str) -> PathBuf {
+    remote_refs_dir(repo_path).join(remote).join(branch)
+}
+
 /// Creates the reference directory layout used by Aura.
 pub async fn ensure_layout(fs: &dyn FileSystem, repo_path: &Path) -> Result<()> {
     fs.create_dir_all(&repo_path.join(AURA_DIR).join("objects")).await?;
     fs.create_dir_all(&heads_dir(repo_path)).await?;
+    fs.create_dir_all(&remote_refs_dir(repo_path)).await?;
     fs.create_dir_all(&remotes_dir(repo_path)).await?;
     Ok(())
 }
@@ -162,6 +173,37 @@ pub async fn write_remote(
         fs.create_dir_all(parent).await?;
     }
     fs.write(&path, format!("{target}\n").as_bytes()).await
+}
+
+/// Reads a remote-tracking branch reference.
+pub async fn read_remote_branch(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>> {
+    let path = remote_branch_path(repo_path, remote, branch);
+    if !fs.exists(&path).await? {
+        return Ok(None);
+    }
+
+    let oid = fs.read_to_string(&path).await?;
+    Ok(Some(oid.trim().to_string()))
+}
+
+/// Writes a remote-tracking branch reference.
+pub async fn write_remote_branch(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+    oid: &str,
+) -> Result<()> {
+    let path = remote_branch_path(repo_path, remote, branch);
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent).await?;
+    }
+    fs.write(&path, format!("{oid}\n").as_bytes()).await
 }
 
 /// Resolves a reference such as `refs/heads/main` to a commit id.

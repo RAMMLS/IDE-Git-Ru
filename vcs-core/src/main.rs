@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use aura_control::{refs, AuraError, ChangeKind, DiffLine, Repository};
+use aura_control::{refs, AuraError, ChangeKind, ChangeStats, DiffLine, PullStatus, Repository};
 
 #[derive(Debug)]
 struct Cli {
@@ -19,6 +19,7 @@ enum Command {
     Branch { name: Option<String> },
     RemoteAdd { name: String, path: PathBuf },
     Push { remote: Option<String>, branch: Option<String> },
+    Pull { remote: Option<String>, branch: Option<String> },
     Diff,
     Help,
 }
@@ -65,8 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Commit { message } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
-            let oid = repo.commit(message).await?;
-            println!("Created commit {oid}");
+            let summary = repo.commit_with_summary(message).await?;
+            print_commit_summary(&summary);
         }
         Command::Status => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
@@ -91,7 +92,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Checkout { branch } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
-            repo.checkout(&branch).await?;
+            match repo.checkout(&branch).await {
+                Ok(()) => {}
+                Err(AuraError::WorkingTreeNotClean) => {
+                    return Err(
+                        "Перед `aura checkout`/`aura switch` закоммить или убери staged/unstaged изменения."
+                            .into(),
+                    );
+                }
+                Err(AuraError::UntrackedWouldBeOverwritten(path)) => {
+                    return Err(format!(
+                        "Не могу переключить ветку: untracked файл `{path}` будет перезаписан."
+                    )
+                    .into());
+                }
+                Err(error) => return Err(error.into()),
+            }
             println!("Checked out branch `{branch}`");
         }
         Command::Branch { name } => {
@@ -130,7 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(summary) => summary,
                 Err(AuraError::RemoteNotFound(name)) => {
                     return Err(format!(
-                        "Remote `{name}` не найден. Сначала настрой его командой `aura remote add {name} <PATH>`."
+                        "Remote `{name}` не настроен в репозитории `{}`. Сначала выполни `aura remote add {name} <PATH>` из этого репозитория или через `aura -C <PATH> remote add {name} <PATH>`.",
+                        repo.path.display()
                     )
                     .into());
                 }
@@ -143,6 +160,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 summary.oid,
                 summary.target.display()
             );
+        }
+        Command::Pull { remote, branch } => {
+            let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
+            let summary = match repo.pull(remote.as_deref(), branch.as_deref()).await {
+                Ok(summary) => summary,
+                Err(AuraError::RemoteNotFound(name)) => {
+                    return Err(format!(
+                        "Remote `{name}` не найден. Сначала настрой его командой `aura remote add {name} <PATH>`."
+                    )
+                    .into());
+                }
+                Err(AuraError::RemoteBranchNotFound { remote, branch }) => {
+                    return Err(format!("В remote `{remote}` нет ветки `{branch}`.").into());
+                }
+                Err(AuraError::WorkingTreeNotClean) => {
+                    return Err("Перед `aura pull` закоммить или убери staged/unstaged изменения.".into());
+                }
+                Err(AuraError::UntrackedWouldBeOverwritten(path)) => {
+                    return Err(format!(
+                        "Не могу выполнить `aura pull`: untracked файл `{path}` будет перезаписан."
+                    )
+                    .into());
+                }
+                Err(AuraError::DivergedBranches { local, remote }) => {
+                    return Err(format!(
+                        "Локальная ветка `{local}` и `{remote}` разошлись. Авто-merge пока не реализован, поддержан только fast-forward pull."
+                    )
+                    .into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            print_pull_summary(&summary);
         }
         Command::Diff => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
@@ -354,6 +403,31 @@ fn parse_cli() -> Result<Cli, String> {
                     }
                 }
             }
+            "pull" => {
+                let parts = args
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                match parts.len() {
+                    0 => Command::Pull {
+                        remote: None,
+                        branch: None,
+                    },
+                    1 => Command::Pull {
+                        remote: Some(parts[0].clone()),
+                        branch: None,
+                    },
+                    2 => Command::Pull {
+                        remote: Some(parts[0].clone()),
+                        branch: Some(parts[1].clone()),
+                    },
+                    _ => {
+                        return Err(
+                            "Команда `pull` поддерживает только формы `aura pull`, `aura pull <REMOTE>` и `aura pull <REMOTE> <BRANCH>`"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
             "diff" => Command::Diff,
             "help" | "--help" | "-h" => Command::Help,
             other => {
@@ -383,6 +457,7 @@ fn print_usage() {
     println!("  switch <NAME>            Alias for checkout");
     println!("  remote add <N> <PATH>    Configure a local Aura remote");
     println!("  push [REMOTE] [BRANCH]   Push to a configured remote");
+    println!("  pull [REMOTE] [BRANCH]   Pull from a configured remote");
     println!("  diff                     Show worktree diff against the index");
     println!("  help                     Show this help");
     println!();
@@ -401,6 +476,8 @@ fn print_usage() {
     println!("  aura push");
     println!("  aura push main");
     println!("  aura push origin main");
+    println!("  aura pull");
+    println!("  aura pull origin main");
 }
 
 fn print_status(title: &str, status: &aura_control::RepositoryStatus) {
@@ -460,5 +537,88 @@ fn print_diff(title: &str, diffs: &[aura_control::FileDiff]) {
         {
             println!();
         }
+    }
+}
+
+fn print_commit_summary(summary: &aura_control::CommitOutcome) {
+    let head = match summary.branch.as_deref() {
+        Some(branch) => branch.to_string(),
+        None => "detached HEAD".to_string(),
+    };
+    println!(
+        "[{} {}] {}",
+        head,
+        short_oid(&summary.oid),
+        summary.message.replace('\n', " ")
+    );
+    print_change_stats(&summary.stats);
+}
+
+fn print_pull_summary(summary: &aura_control::PullSummary) {
+    match summary.status {
+        PullStatus::AlreadyUpToDate => {
+            println!("Already up to date.");
+        }
+        PullStatus::FastForward => {
+            println!("From {} ({})", summary.remote, summary.target.display());
+            let from = summary.previous_oid.as_deref().map(short_oid).unwrap_or("(empty)");
+            println!("Updating {}..{}", from, short_oid(&summary.oid));
+            println!("Fast-forward");
+            if let Some(stats) = &summary.stats {
+                print_change_stats(stats);
+            }
+        }
+    }
+}
+
+fn print_change_stats(stats: &ChangeStats) {
+    for file in &stats.files {
+        let total = file.insertions + file.deletions;
+        let marks = format_change_marks(file.insertions, file.deletions);
+        if marks.is_empty() {
+            println!(" {} | {}", file.path.display(), total);
+        } else {
+            println!(" {} | {} {}", file.path.display(), total, marks);
+        }
+    }
+
+    let mut parts = vec![format!(
+        " {} {} changed",
+        stats.files_changed,
+        pluralize(stats.files_changed, "file", "files")
+    )];
+    if stats.insertions > 0 {
+        parts.push(format!(
+            "{} {}(+)",
+            stats.insertions,
+            pluralize(stats.insertions, "insertion", "insertions")
+        ));
+    }
+    if stats.deletions > 0 {
+        parts.push(format!(
+            "{} {}(-)",
+            stats.deletions,
+            pluralize(stats.deletions, "deletion", "deletions")
+        ));
+    }
+    println!("{}", parts.join(", "));
+}
+
+fn short_oid(oid: &str) -> &str {
+    let end = oid.len().min(7);
+    &oid[..end]
+}
+
+fn format_change_marks(insertions: usize, deletions: usize) -> String {
+    let insertions = insertions.min(20);
+    let deletions = deletions.min(20);
+    format!("{}{}", "+".repeat(insertions), "-".repeat(deletions))
+}
+
+fn pluralize<'a>(value: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if value == 1 {
+        singular
+    } else {
+        plural
     }
 }

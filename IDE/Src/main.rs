@@ -22,6 +22,8 @@ pub enum Message {
 
     // Сохранение
     SaveFiles,
+
+    SetNewFileName(String),
 }
 
 // Реализация логики Iced для нашей структуры
@@ -69,6 +71,10 @@ impl Application for MyIde {
                     eprintln!("Не удалось создать файл: {}", e);
                 }
             }
+        }
+
+        Message::SetNewFileName(name) => {
+            self.state.new_file_name = name;
         }
 
         Message::SaveFiles => {

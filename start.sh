@@ -1,38 +1,23 @@
 #!/bin/bash
+set -e
 
-# Скрипт для одновременного запуска сервера и фронтенда Aura
+echo "Starting Aura VCS..."
 
-# Завершаем оба процесса при остановке скрипта (Ctrl+C)
-trap 'echo "\nОстановка сервисов..."; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit' SIGINT SIGTERM
-
-# Проверяем, передан ли путь к репозиторию, иначе используем текущую директорию
-REPO_PATH=${1:-.}
-export AURA_REPO_PATH=$REPO_PATH
-
-echo "🚀 Запуск Aura VCS..."
-echo "📂 Репозиторий: $REPO_PATH"
-
-# Запуск Backend (Rust)
-echo "📦 Запуск backend сервера на порту 3000..."
+# Start the Rust server
 cd server
 cargo run &
-BACKEND_PID=$!
+SERVER_PID=$!
 cd ..
 
-# Небольшая пауза, чтобы бекенд успел стартовать
-sleep 2
-
-# Запуск Frontend (Vite)
-echo "🎨 Запуск frontend интерфейса на порту 5000..."
-cd web
+# Start the React client
+cd client
 npm run dev &
-FRONTEND_PID=$!
+CLIENT_PID=$!
 cd ..
 
-echo "✅ Все сервисы запущены!"
-echo "   Backend API: http://localhost:3000"
-echo "   Frontend UI: http://localhost:5000"
-echo "   (Нажмите Ctrl+C для остановки)"
+echo "Aura VCS is running."
+echo "Server PID: $SERVER_PID"
+echo "Client PID: $CLIENT_PID"
+echo "Press Ctrl+C to stop."
 
-# Ожидание завершения процессов
-wait
+wait $SERVER_PID $CLIENT_PID

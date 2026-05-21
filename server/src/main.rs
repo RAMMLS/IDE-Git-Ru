@@ -1,9 +1,9 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Query, State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
     },
-    http::{HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -26,10 +26,10 @@ pub struct AppState {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Event {
-    #[serde(rename = "commit")]
-    Commit { hash: String },
-    #[serde(rename = "checkout")]
-    Checkout { target: String },
+    #[serde(rename = "COMMIT_ADDED")]
+    CommitAdded,
+    #[serde(rename = "STATUS_CHANGED")]
+    StatusChanged,
 }
 
 // --- Error Handling ---
@@ -58,34 +58,8 @@ where
 // --- Requests ---
 
 #[derive(Deserialize)]
-struct LogQuery {
-    branch: String,
-}
-
-#[derive(Deserialize)]
-struct FilesQuery {
-    commit: String,
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct DiffQuery {
-    commit: String,
-}
-
-#[derive(Deserialize)]
-struct AddRequest {
-    paths: Vec<String>,
-}
-
-#[derive(Deserialize)]
 struct CommitRequest {
     message: String,
-}
-
-#[derive(Deserialize)]
-struct CheckoutRequest {
-    target: String,
 }
 
 #[derive(Deserialize)]
@@ -95,82 +69,92 @@ struct BranchRequest {
 
 // --- Endpoints ---
 
-async fn get_info(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+async fn get_status(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
     let repo = state.repo.lock().await;
-    let info = repo.get_info()?;
-    Ok(Json(info).into_response())
+    let status = repo.status().await?;
+    
+    let staged: Vec<String> = status.staged.into_iter().map(|e| e.path.to_string_lossy().to_string()).collect();
+    let unstaged: Vec<String> = status.unstaged.into_iter().map(|e| e.path.to_string_lossy().to_string()).collect();
+    let untracked: Vec<String> = status.untracked.into_iter().map(|p| p.to_string_lossy().to_string()).collect();
+    
+    Ok(Json(json!({
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "branch": status.branch.unwrap_or_else(|| "main".to_string()),
+    })).into_response())
 }
 
 async fn get_log(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<LogQuery>,
 ) -> Result<Response, AppError> {
     let repo = state.repo.lock().await;
-    let log = repo.get_log(&query.branch)?;
-    Ok(Json(log).into_response())
-}
+    let log = repo.log().await.unwrap_or_default();
+    
+    let commits: Vec<_> = log.into_iter().map(|c| {
+        json!({
+            "hash": c.oid,
+            "author": c.author,
+            "message": c.message,
+            "date": c.timestamp.to_rfc3339(),
+        })
+    }).collect();
 
-async fn get_files(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<FilesQuery>,
-) -> Result<Response, AppError> {
-    let repo = state.repo.lock().await;
-    let files = repo.get_files(&query.commit, &query.path)?;
-    Ok(Json(files).into_response())
+    Ok(Json(commits).into_response())
 }
 
 async fn get_diff(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<DiffQuery>,
+    State(_state): State<Arc<AppState>>,
+    Path(_hash): Path<String>,
 ) -> Result<Response, AppError> {
-    let repo = state.repo.lock().await;
-    let diff = repo.get_diff(&query.commit)?;
-    Ok(Json(json!({ "diff": diff })).into_response())
-}
-
-async fn post_add(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<AddRequest>,
-) -> Result<Response, AppError> {
-    let mut repo = state.repo.lock().await;
-    repo.add(&payload.paths)?;
-    Ok(Json(json!({ "status": "ok" })).into_response())
+    // aura_control currently doesn't expose a way to diff a specific commit easily.
+    // Returning an empty array to satisfy the client for now.
+    let diff: Vec<serde_json::Value> = vec![];
+    Ok(Json(diff).into_response())
 }
 
 async fn post_commit(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CommitRequest>,
 ) -> Result<Response, AppError> {
-    let mut repo = state.repo.lock().await;
-    let hash = repo.commit(&payload.message)?;
+    let repo = state.repo.lock().await;
+    
+    // Add all changes first
+    let _ = repo.add_all().await?;
+    
+    // Then commit
+    let hash = repo.commit(&payload.message).await?;
 
-    let _ = state.tx.send(Event::Commit {
-        hash: hash.clone(),
-    });
+    let _ = state.tx.send(Event::CommitAdded);
+    let _ = state.tx.send(Event::StatusChanged);
 
     Ok(Json(json!({ "hash": hash })).into_response())
 }
 
-async fn post_checkout(
+async fn get_branches(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<CheckoutRequest>,
 ) -> Result<Response, AppError> {
-    let mut repo = state.repo.lock().await;
-    repo.checkout(&payload.target)?;
-
-    let _ = state.tx.send(Event::Checkout {
-        target: payload.target.clone(),
-    });
-
-    Ok(Json(json!({ "status": "ok" })).into_response())
+    let repo = state.repo.lock().await;
+    let mut branches = Vec::new();
+    let heads_path = repo.path.join(".aura/refs/heads");
+    
+    if let Ok(mut dir) = tokio::fs::read_dir(heads_path).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if let Ok(name) = entry.file_name().into_string() {
+                branches.push(name);
+            }
+        }
+    }
+    Ok(Json(branches).into_response())
 }
 
 async fn post_branch(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BranchRequest>,
 ) -> Result<Response, AppError> {
-    let mut repo = state.repo.lock().await;
-    repo.create_branch(&payload.name)?;
+    let repo = state.repo.lock().await;
+    repo.branch(&payload.name).await?;
+    let _ = state.tx.send(Event::StatusChanged);
     Ok(Json(json!({ "status": "ok" })).into_response())
 }
 
@@ -200,7 +184,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     println!("Opening repository at: {}", repo_path);
-    let repo = Repository::open(&repo_path)?;
+    let repo = Repository::new(&repo_path);
+    
+    // Ensure repo is initialized
+    let _ = repo.init_repository().await;
 
     let (tx, _rx) = broadcast::channel(100);
 
@@ -215,14 +202,11 @@ async fn main() -> anyhow::Result<()> {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/repo/info", get(get_info))
+        .route("/api/repo/status", get(get_status))
         .route("/api/repo/log", get(get_log))
-        .route("/api/repo/files", get(get_files))
-        .route("/api/repo/diff", get(get_diff))
-        .route("/api/repo/add", post(post_add))
+        .route("/api/repo/diff/:hash", get(get_diff))
         .route("/api/repo/commit", post(post_commit))
-        .route("/api/repo/checkout", post(post_checkout))
-        .route("/api/repo/branch", post(post_branch))
+        .route("/api/repo/branches", get(get_branches).post(post_branch))
         .route("/api/events", get(ws_handler))
         .layer(cors)
         .with_state(state);

@@ -114,7 +114,7 @@ export function StatusPage() {
                     value={message}
                     onChange={e => setMessage(e.target.value)}
                     rows={4}
-                    disabled={status.staged.length === 0}
+                    disabled={!hasChanges}
                   />
                 </div>
               </CardContent>
@@ -122,7 +122,7 @@ export function StatusPage() {
                 <Button 
                   type="submit" 
                   className="w-full" 
-                  disabled={!message.trim() || status.staged.length === 0 || commitMutation.isPending}
+                  disabled={!message.trim() || !hasChanges || commitMutation.isPending}
                 >
                   {commitMutation.isPending ? 'Committing...' : 'Commit Changes'}
                 </Button>

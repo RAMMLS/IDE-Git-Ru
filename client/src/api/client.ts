@@ -1,11 +1,20 @@
 import axios from 'axios';
 
+const explicitBaseUrl = import.meta.env.VITE_AURA_API_URL?.trim();
+const normalizedBaseUrl = explicitBaseUrl
+  ? explicitBaseUrl.replace(/\/+$/, '').replace(/\/repo$/, '')
+  : '/api';
+
 export const apiClient = axios.create({
-  baseURL: 'http://localhost:3000/api/repo', // Note: User specified `http://localhost:3000/api` in prompt but `project_memory` states `/api/repo/`. Let's use `/api/repo/` or just `/api` based on memory. I'll use `http://localhost:3000/api/repo`.
+  baseURL: normalizedBaseUrl,
   headers: {
     'Content-Type': 'application/json',
   },
 });
+
+function repoParams(repoId?: string) {
+  return repoId ? { params: { repo: repoId } } : undefined;
+}
 
 export interface Commit {
   hash: string;
@@ -25,31 +34,105 @@ export interface Status {
   unstaged: string[];
   untracked: string[];
   branch: string;
+  head?: string | null;
+}
+
+export interface RemoteConfig {
+  name: string;
+  target: string;
+}
+
+export interface PushSummary {
+  remote: string;
+  branch: string;
+  hash: string;
+  target: string;
+}
+
+export interface FileStat {
+  path: string;
+  kind: 'added' | 'modified' | 'deleted';
+  insertions: number;
+  deletions: number;
+}
+
+export interface ChangeStats {
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  files: FileStat[];
+}
+
+export interface PullSummary {
+  remote: string;
+  source_branch: string;
+  local_branch: string;
+  hash: string;
+  previous_hash?: string | null;
+  status: 'already_up_to_date' | 'fast_forward';
+  target: string;
+  stats?: ChangeStats | null;
+}
+
+export interface RepoRecord {
+  id: string;
+  name: string;
+  path: string;
+  storage: 'hosted' | 'linked';
+}
+
+export interface RepoUpsertPayload {
+  name: string;
+  path?: string;
 }
 
 export const api = {
-  getCommits: async () => {
-    const { data } = await apiClient.get<Commit[]>('/log');
+  listRepos: async () => {
+    const { data } = await apiClient.get<RepoRecord[]>('/repos');
     return data;
   },
-  getCommitDiff: async (hash: string) => {
-    const { data } = await apiClient.get<FileDiff[]>(`/diff/${hash}`);
+  upsertRepo: async (payload: RepoUpsertPayload) => {
+    const { data } = await apiClient.post<RepoRecord>('/repos', payload);
     return data;
   },
-  getStatus: async () => {
-    const { data } = await apiClient.get<Status>('/status');
+  getCommits: async (repoId?: string) => {
+    const { data } = await apiClient.get<Commit[]>('/repo/log', repoParams(repoId));
     return data;
   },
-  commit: async (message: string) => {
-    const { data } = await apiClient.post('/commit', { message });
+  getCommitDiff: async (hash: string, repoId?: string) => {
+    const { data } = await apiClient.get<FileDiff[]>(`/repo/diff/${hash}`, repoParams(repoId));
     return data;
   },
-  getBranches: async () => {
-    const { data } = await apiClient.get<string[]>('/branches');
+  getStatus: async (repoId?: string) => {
+    const { data } = await apiClient.get<Status>('/repo/status', repoParams(repoId));
     return data;
   },
-  createBranch: async (name: string) => {
-    const { data } = await apiClient.post('/branches', { name });
+  commit: async (message: string, repoId?: string) => {
+    const { data } = await apiClient.post('/repo/commit', { message }, repoParams(repoId));
     return data;
-  }
+  },
+  getBranches: async (repoId?: string) => {
+    const { data } = await apiClient.get<string[]>('/repo/branches', repoParams(repoId));
+    return data;
+  },
+  createBranch: async (name: string, repoId?: string) => {
+    const { data } = await apiClient.post('/repo/branches', { name }, repoParams(repoId));
+    return data;
+  },
+  getRemotes: async (repoId?: string) => {
+    const { data } = await apiClient.get<RemoteConfig[]>('/repo/remotes', repoParams(repoId));
+    return data;
+  },
+  saveRemote: async (payload: RemoteConfig, repoId?: string) => {
+    const { data } = await apiClient.post<RemoteConfig>('/repo/remotes', payload, repoParams(repoId));
+    return data;
+  },
+  push: async (payload: { remote?: string; branch?: string }, repoId?: string) => {
+    const { data } = await apiClient.post<PushSummary>('/repo/push', payload, repoParams(repoId));
+    return data;
+  },
+  pull: async (payload: { remote?: string; branch?: string }, repoId?: string) => {
+    const { data } = await apiClient.post<PullSummary>('/repo/pull', payload, repoParams(repoId));
+    return data;
+  },
 };

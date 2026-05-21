@@ -579,6 +579,24 @@ impl Repository {
         refs::set_head_to_branch(self.fs.as_ref(), &self.path, branch).await
     }
 
+    /// Forces the working tree and index to match the requested branch.
+    ///
+    /// This is intended for server-managed repositories and temporary transport
+    /// clones where Aura owns the whole worktree and can safely rewrite it.
+    pub async fn materialize_branch(&self, branch: &str) -> Result<()> {
+        self.ensure_initialized().await?;
+
+        let commit_oid = refs::read_branch(self.fs.as_ref(), &self.path, branch)
+            .await?
+            .ok_or_else(|| AuraError::BranchNotFound(branch.to_string()))?;
+        let commit = object::read_commit(self.fs.as_ref(), &self.path, &commit_oid).await?;
+        let target = self.collect_tree_entries(&commit.tree).await?;
+        let current = self.collect_worktree_oids().await?;
+
+        self.apply_snapshot_to_worktree(&current, &target).await?;
+        refs::set_head_to_branch(self.fs.as_ref(), &self.path, branch).await
+    }
+
     /// Returns repository status information.
     pub async fn status(&self) -> Result<RepositoryStatus> {
         self.ensure_initialized().await?;
@@ -1289,6 +1307,113 @@ mod tests {
             Some(remote_commit.as_str())
         );
         assert_eq!(summary.stats.expect("fast-forward should include stats").insertions, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_remote_updates_existing_target() {
+        let root = temp_repo_path("remote-update-local");
+        let first_remote = temp_repo_path("remote-update-first");
+        let second_remote = temp_repo_path("remote-update-second");
+        let repo = Repository::init(&root).await.expect("repo should init");
+
+        repo.add_remote("origin", &first_remote)
+            .await
+            .expect("initial remote should be added");
+        let updated_target = repo
+            .add_remote("origin", &second_remote)
+            .await
+            .expect("existing remote should be updated");
+
+        assert_eq!(updated_target, second_remote);
+        assert_eq!(
+            refs::read_remote(repo.filesystem(), &repo.path, "origin")
+                .await
+                .expect("remote should be readable")
+                .as_deref(),
+            Some(second_remote.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_copies_commit_chain_to_remote_branch() {
+        let local_root = temp_repo_path("push-local");
+        let remote_root = temp_repo_path("push-remote");
+        let local = Repository::init(&local_root)
+            .await
+            .expect("local repo should init");
+
+        write_file(&local_root.join("hello.txt"), b"hello\n").await;
+        local.add_all().await.expect("initial file should be staged");
+        let first_commit = local
+            .commit("initial commit")
+            .await
+            .expect("initial commit should succeed");
+
+        write_file(&local_root.join("hello.txt"), b"hello\nsecond line\n").await;
+        local.add_all().await.expect("updated file should be staged");
+        let second_commit = local
+            .commit("second commit")
+            .await
+            .expect("second commit should succeed");
+
+        local
+            .add_remote("origin", &remote_root)
+            .await
+            .expect("remote should be configured");
+        let summary = local.push(None, None).await.expect("push should succeed");
+
+        let remote = Repository::new(&remote_root);
+        let log = remote.log().await.expect("remote log should be readable");
+
+        assert_eq!(summary.remote, "origin");
+        assert_eq!(summary.branch, "main");
+        assert_eq!(summary.oid, second_commit);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].oid, second_commit);
+        assert_eq!(log[1].oid, first_commit);
+        assert_eq!(
+            refs::read_branch(remote.filesystem(), &remote.path, "main")
+                .await
+                .expect("remote main should be readable")
+                .as_deref(),
+            Some(second_commit.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pull_updates_remote_tracking_branch_reference() {
+        let remote_root = temp_repo_path("pull-tracking-remote");
+        let local_root = temp_repo_path("pull-tracking-local");
+        let remote = Repository::init(&remote_root)
+            .await
+            .expect("remote repo should init");
+        let local = Repository::init(&local_root)
+            .await
+            .expect("local repo should init");
+
+        write_file(&remote_root.join("tracked.txt"), b"tracked from remote\n").await;
+        remote
+            .add_all()
+            .await
+            .expect("remote file should be staged");
+        let remote_commit = remote
+            .commit("tracked commit")
+            .await
+            .expect("remote commit should succeed");
+
+        local
+            .add_remote("origin", &remote_root)
+            .await
+            .expect("remote should be configured");
+        local.pull(None, None).await.expect("pull should succeed");
+
+        assert_eq!(
+            refs::read_remote_branch(local.filesystem(), &local.path, "origin", "main")
+                .await
+                .expect("remote tracking branch should be readable")
+                .as_deref(),
+            Some(remote_commit.as_str())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

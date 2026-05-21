@@ -1,0 +1,10 @@
+{
+  "repos": [
+    {
+      "id": "demo",
+      "name": "demo",
+      "path": ".aura-server/repos/demo",
+      "storage": "hosted"
+    }
+  ]
+}

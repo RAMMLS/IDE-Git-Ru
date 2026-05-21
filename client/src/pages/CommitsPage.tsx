@@ -2,13 +2,27 @@ import { useQuery } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
 import { api } from '@/api/client';
+import { useRepoContext } from '@/components/providers/repo-context';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Card } from '@/components/ui/card';
 import { GitCommit } from 'lucide-react';
 
 export function CommitsPage() {
   const navigate = useNavigate();
-  const { data: commits, isLoading } = useQuery({ queryKey: ['commits'], queryFn: api.getCommits });
+  const { selectedRepo, selectedRepoId } = useRepoContext();
+  const { data: commits, isLoading } = useQuery({
+    queryKey: ['commits', selectedRepoId],
+    queryFn: () => api.getCommits(selectedRepoId ?? undefined),
+    enabled: !!selectedRepoId,
+  });
+
+  if (!selectedRepoId) {
+    return (
+      <div className="p-8 text-muted-foreground">
+        Создай или выбери репозиторий на странице `Status`, чтобы увидеть историю коммитов.
+      </div>
+    );
+  }
 
   if (isLoading) {
     return <div className="p-8 text-muted-foreground">Loading commits...</div>;
@@ -22,7 +36,9 @@ export function CommitsPage() {
     <div className="h-full flex flex-col p-6">
       <div className="mb-6">
         <h1 className="text-2xl font-bold tracking-tight">Commit History</h1>
-        <p className="text-muted-foreground">Recent changes in the repository.</p>
+        <p className="text-muted-foreground">
+          Recent changes in {selectedRepo?.name ?? 'the selected repository'}.
+        </p>
       </div>
 
       <Card className="flex-1 overflow-hidden flex flex-col">

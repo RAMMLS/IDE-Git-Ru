@@ -2,6 +2,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, File as FileIcon } from 'lucide-react';
 import { api } from '@/api/client';
+import { useRepoContext } from '@/components/providers/repo-context';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
@@ -9,12 +10,17 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 export function DiffPage() {
   const { hash } = useParams<{ hash: string }>();
   const navigate = useNavigate();
+  const { selectedRepo, selectedRepoId } = useRepoContext();
 
   const { data: diffs, isLoading } = useQuery({
-    queryKey: ['diff', hash],
-    queryFn: () => api.getCommitDiff(hash!),
-    enabled: !!hash,
+    queryKey: ['diff', selectedRepoId, hash],
+    queryFn: () => api.getCommitDiff(hash!, selectedRepoId ?? undefined),
+    enabled: !!hash && !!selectedRepoId,
   });
+
+  if (!selectedRepoId) {
+    return <div className="p-8 text-muted-foreground">Сначала выбери репозиторий.</div>;
+  }
 
   if (isLoading) {
     return <div className="p-8 text-muted-foreground">Loading diff...</div>;
@@ -29,6 +35,7 @@ export function DiffPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Commit Diff</h1>
           <p className="text-muted-foreground font-mono text-sm">{hash}</p>
+          <p className="text-muted-foreground text-sm">{selectedRepo?.name}</p>
         </div>
       </div>
 

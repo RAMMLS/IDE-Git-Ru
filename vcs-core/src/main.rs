@@ -1,6 +1,13 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use aura_control::{refs, AuraError, ChangeKind, ChangeStats, DiffLine, PullStatus, Repository};
+use async_recursion::async_recursion;
+use aura_control::{
+    object::{self, Blob, Commit, ObjectKind, Tree},
+    refs, AuraError, ChangeKind, ChangeStats, DiffLine, PullStatus, Repository,
+};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 struct Cli {
@@ -17,11 +24,26 @@ enum Command {
     Log,
     Checkout { branch: String },
     Branch { name: Option<String> },
-    RemoteAdd { name: String, path: PathBuf },
+    RemoteAdd { name: String, target: String },
     Push { remote: Option<String>, branch: Option<String> },
     Pull { remote: Option<String>, branch: Option<String> },
     Diff,
     Help,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransportObject {
+    oid: String,
+    kind: String,
+    body_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransportPack {
+    repo_id: String,
+    branch: String,
+    oid: String,
+    objects: Vec<TransportObject>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -132,16 +154,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Command::RemoteAdd { name, path } => {
-            let command_dir = resolve_command_dir(cli.repo.as_ref(), &current_dir);
+        Command::RemoteAdd { name, target } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
-            let target = resolve_from_base(&command_dir, &path);
-            let stored = repo.add_remote(&name, target).await?;
+            let stored_target = normalize_remote_target(cli.repo.as_ref(), &current_dir, &target);
+            let stored = repo.add_remote(&name, stored_target).await?;
             println!("Configured remote `{name}` -> {}", stored.display());
         }
         Command::Push { remote, branch } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
             let (remote, branch) = resolve_push_target(&repo, remote, branch).await?;
+            let remote_name = remote.clone().unwrap_or_else(|| "origin".to_string());
+            if let Some(target) = refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await? {
+                if is_http_remote(&target) {
+                    let summary = http_push(&repo, &remote_name, &target, branch.as_deref()).await?;
+                    println!(
+                        "Pushed branch `{}` to `{}` at {} ({})",
+                        summary.branch,
+                        summary.remote,
+                        summary.oid,
+                        summary.target.display()
+                    );
+                    return Ok(());
+                }
+            }
             let summary = match repo.push(remote.as_deref(), branch.as_deref()).await {
                 Ok(summary) => summary,
                 Err(AuraError::RemoteNotFound(name)) => {
@@ -163,6 +198,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Pull { remote, branch } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
+            let remote_name = remote.clone().unwrap_or_else(|| "origin".to_string());
+            if let Some(target) = refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await? {
+                if is_http_remote(&target) {
+                    let summary = http_pull(&repo, &remote_name, &target, branch.as_deref()).await?;
+                    print_pull_summary(&summary);
+                    return Ok(());
+                }
+            }
             let summary = match repo.pull(remote.as_deref(), branch.as_deref()).await {
                 Ok(summary) => summary,
                 Err(AuraError::RemoteNotFound(name)) => {
@@ -244,6 +287,240 @@ async fn resolve_push_target(
     }
 
     Ok((Some(value), None))
+}
+
+fn is_http_remote(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn normalize_remote_target(repo: Option<&PathBuf>, current_dir: &Path, target: &str) -> String {
+    if is_http_remote(target) {
+        return target.trim_end_matches('/').to_string();
+    }
+
+    let command_dir = resolve_command_dir(repo, current_dir);
+    resolve_from_base(&command_dir, Path::new(target))
+        .to_string_lossy()
+        .to_string()
+}
+
+async fn http_push(
+    repo: &Repository,
+    remote_name: &str,
+    target: &str,
+    branch: Option<&str>,
+) -> Result<aura_control::PushSummary, Box<dyn std::error::Error>> {
+    let branch = match branch {
+        Some(branch) => branch.to_string(),
+        None => refs::current_branch(repo.filesystem(), &repo.path)
+            .await?
+            .ok_or("Невозможно выполнить push из detached HEAD.")?,
+    };
+    let oid = refs::read_branch(repo.filesystem(), &repo.path, &branch)
+        .await?
+        .ok_or_else(|| format!("В локальном репозитории нет ветки `{branch}`"))?;
+    let repo_id = remote_repo_id(target)?;
+    let pack = TransportPack {
+        repo_id: repo_id.clone(),
+        branch: branch.clone(),
+        oid: oid.clone(),
+        objects: collect_pack(repo, &oid).await?,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{target}/push"))
+        .json(&pack)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP push failed: {}", response.text().await?).into());
+    }
+
+    Ok(aura_control::PushSummary {
+        remote: remote_name.to_string(),
+        branch,
+        oid,
+        target: PathBuf::from(target),
+    })
+}
+
+async fn http_pull(
+    repo: &Repository,
+    remote_name: &str,
+    target: &str,
+    branch: Option<&str>,
+) -> Result<aura_control::PullSummary, Box<dyn std::error::Error>> {
+    let requested_branch = match branch {
+        Some(branch) => branch.to_string(),
+        None => refs::current_branch(repo.filesystem(), &repo.path)
+            .await?
+            .ok_or("Невозможно выполнить pull в detached HEAD.")?,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{target}/export"))
+        .query(&[("branch", requested_branch.as_str())])
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP pull failed: {}", response.text().await?).into());
+    }
+
+    let pack: TransportPack = response.json().await?;
+    let temp_remote_path = std::env::temp_dir().join(format!(
+        "aura-http-remote-{}-{}",
+        pack.repo_id,
+        std::process::id()
+    ));
+    let temp_remote = Repository::init(&temp_remote_path).await?;
+    for object in &pack.objects {
+        write_transport_object(&temp_remote, object).await?;
+    }
+    refs::write_branch(
+        temp_remote.filesystem(),
+        &temp_remote.path,
+        &pack.branch,
+        &pack.oid,
+    )
+    .await?;
+    temp_remote.materialize_branch(&pack.branch).await?;
+
+    let temp_remote_name = format!("http-{remote_name}");
+    repo.add_remote(&temp_remote_name, &temp_remote_path).await?;
+    let summary = repo
+        .pull(Some(temp_remote_name.as_str()), Some(pack.branch.as_str()))
+        .await?;
+    let _ = tokio::fs::remove_file(refs::remote_path(&repo.path, &temp_remote_name)).await;
+    let _ = tokio::fs::remove_dir_all(&temp_remote_path).await;
+
+    Ok(aura_control::PullSummary {
+        remote: remote_name.to_string(),
+        source_branch: summary.source_branch,
+        local_branch: summary.local_branch,
+        oid: summary.oid,
+        previous_oid: summary.previous_oid,
+        status: summary.status,
+        stats: summary.stats,
+        target: PathBuf::from(target),
+    })
+}
+
+fn remote_repo_id(target: &str) -> Result<String, Box<dyn std::error::Error>> {
+    target
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .ok_or_else(|| "Не удалось определить id remote-репозитория из URL".into())
+}
+
+async fn collect_pack(
+    repo: &Repository,
+    oid: &str,
+) -> Result<Vec<TransportObject>, Box<dyn std::error::Error>> {
+    let mut seen = BTreeSet::new();
+    let mut objects = Vec::new();
+    collect_commit_objects(repo, oid, &mut seen, &mut objects).await?;
+    Ok(objects)
+}
+
+#[async_recursion]
+async fn collect_commit_objects(
+    repo: &Repository,
+    oid: &str,
+    seen: &mut BTreeSet<String>,
+    objects: &mut Vec<TransportObject>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !seen.insert(oid.to_string()) {
+        return Ok(());
+    }
+
+    let commit = object::read_commit(repo.filesystem(), &repo.path, oid).await?;
+    objects.push(TransportObject {
+        oid: oid.to_string(),
+        kind: "commit".to_string(),
+        body_base64: STANDARD.encode(commit.serialize()),
+    });
+    collect_tree_objects(repo, &commit.tree, seen, objects).await?;
+    for parent in &commit.parents {
+        collect_commit_objects(repo, parent, seen, objects).await?;
+    }
+    Ok(())
+}
+
+#[async_recursion]
+async fn collect_tree_objects(
+    repo: &Repository,
+    oid: &str,
+    seen: &mut BTreeSet<String>,
+    objects: &mut Vec<TransportObject>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !seen.insert(oid.to_string()) {
+        return Ok(());
+    }
+
+    let tree = object::read_tree(repo.filesystem(), &repo.path, oid).await?;
+    objects.push(TransportObject {
+        oid: oid.to_string(),
+        kind: "tree".to_string(),
+        body_base64: STANDARD.encode(tree.serialize()?),
+    });
+    for entry in &tree.entries {
+        if entry.mode == "40000" {
+            collect_tree_objects(repo, &entry.oid, seen, objects).await?;
+        } else {
+            collect_blob_object(repo, &entry.oid, seen, objects).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_blob_object(
+    repo: &Repository,
+    oid: &str,
+    seen: &mut BTreeSet<String>,
+    objects: &mut Vec<TransportObject>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !seen.insert(oid.to_string()) {
+        return Ok(());
+    }
+
+    let blob = object::read_blob(repo.filesystem(), &repo.path, oid).await?;
+    objects.push(TransportObject {
+        oid: oid.to_string(),
+        kind: "blob".to_string(),
+        body_base64: STANDARD.encode(blob.serialize()),
+    });
+    Ok(())
+}
+
+async fn write_transport_object(
+    repo: &Repository,
+    packed: &TransportObject,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = STANDARD.decode(&packed.body_base64)?;
+    let kind = ObjectKind::from_str(&packed.kind)?;
+
+    match kind {
+        ObjectKind::Blob => {
+            object::write_blob(repo.filesystem(), &repo.path, &Blob::deserialize(&body)).await?;
+        }
+        ObjectKind::Tree => {
+            let tree = Tree::deserialize(&body)?;
+            object::write_tree(repo.filesystem(), &repo.path, &tree).await?;
+        }
+        ObjectKind::Commit => {
+            let commit = Commit::deserialize(&body)?;
+            object::write_commit(repo.filesystem(), &repo.path, &commit).await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_command_dir(repo: Option<&PathBuf>, current_dir: &Path) -> PathBuf {
@@ -364,7 +641,7 @@ fn parse_cli() -> Result<Cli, String> {
                         let name = args
                             .next()
                             .ok_or_else(|| "Команда `remote add` требует имя remote".to_string())?;
-                        let path = args
+                        let target = args
                             .next()
                             .ok_or_else(|| "Команда `remote add` требует путь к remote-репозиторию".to_string())?;
                         if args.next().is_some() {
@@ -372,7 +649,7 @@ fn parse_cli() -> Result<Cli, String> {
                         }
                         Command::RemoteAdd {
                             name: name.to_string_lossy().into_owned(),
-                            path: PathBuf::from(path),
+                            target: target.to_string_lossy().into_owned(),
                         }
                     }
                     other => return Err(format!("Неизвестная подкоманда `remote {other}`")),
@@ -455,7 +732,7 @@ fn print_usage() {
     println!("  branch [NAME]            List branches or create a new branch");
     println!("  checkout <NAME>          Switch to an existing branch");
     println!("  switch <NAME>            Alias for checkout");
-    println!("  remote add <N> <PATH>    Configure a local Aura remote");
+    println!("  remote add <N> <TARGET>  Configure a local path or HTTP Aura remote");
     println!("  push [REMOTE] [BRANCH]   Push to a configured remote");
     println!("  pull [REMOTE] [BRANCH]   Pull from a configured remote");
     println!("  diff                     Show worktree diff against the index");

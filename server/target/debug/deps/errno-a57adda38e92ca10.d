@@ -1,0 +1,8 @@
+/Users/rammls/Projects/IDE-Git-Ru/server/target/debug/deps/errno-a57adda38e92ca10.d: /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs
+
+/Users/rammls/Projects/IDE-Git-Ru/server/target/debug/deps/liberrno-a57adda38e92ca10.rlib: /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs
+
+/Users/rammls/Projects/IDE-Git-Ru/server/target/debug/deps/liberrno-a57adda38e92ca10.rmeta: /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs /Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs
+
+/Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs:
+/Users/rammls/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs:

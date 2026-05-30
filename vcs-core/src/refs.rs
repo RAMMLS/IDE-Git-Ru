@@ -54,7 +54,8 @@ pub fn remote_branch_path(repo_path: &Path, remote: &str, branch: &str) -> PathB
 
 /// Creates the reference directory layout used by Aura.
 pub async fn ensure_layout(fs: &dyn FileSystem, repo_path: &Path) -> Result<()> {
-    fs.create_dir_all(&repo_path.join(AURA_DIR).join("objects")).await?;
+    fs.create_dir_all(&repo_path.join(AURA_DIR).join("objects"))
+        .await?;
     fs.create_dir_all(&heads_dir(repo_path)).await?;
     fs.create_dir_all(&remote_refs_dir(repo_path)).await?;
     fs.create_dir_all(&remotes_dir(repo_path)).await?;
@@ -82,10 +83,17 @@ pub async fn read_head(fs: &dyn FileSystem, repo_path: &Path) -> Result<HeadRef>
 }
 
 /// Writes `HEAD` as a symbolic branch reference.
-pub async fn write_head_symbolic(fs: &dyn FileSystem, repo_path: &Path, branch: &str) -> Result<()> {
+pub async fn write_head_symbolic(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    branch: &str,
+) -> Result<()> {
     let reference = normalize_branch_ref(branch);
-    fs.write(&head_path(repo_path), format!("ref: {reference}\n").as_bytes())
-        .await
+    fs.write(
+        &head_path(repo_path),
+        format!("ref: {reference}\n").as_bytes(),
+    )
+    .await
 }
 
 /// Writes `HEAD` in detached mode.
@@ -256,11 +264,7 @@ pub async fn list_branches(fs: &dyn FileSystem, repo_path: &Path) -> Result<Vec<
 }
 
 /// Updates `HEAD` to point to the provided branch.
-pub async fn set_head_to_branch(
-    fs: &dyn FileSystem,
-    repo_path: &Path,
-    branch: &str,
-) -> Result<()> {
+pub async fn set_head_to_branch(fs: &dyn FileSystem, repo_path: &Path, branch: &str) -> Result<()> {
     write_head_symbolic(fs, repo_path, branch).await
 }
 

@@ -269,7 +269,11 @@ pub fn object_path(repo_path: &Path, oid: &str) -> Result<PathBuf> {
     }
 
     let (dir, file) = oid.split_at(2);
-    Ok(repo_path.join(AURA_DIR).join("objects").join(dir).join(file))
+    Ok(repo_path
+        .join(AURA_DIR)
+        .join("objects")
+        .join(dir)
+        .join(file))
 }
 
 /// Writes a raw object body to the object database and returns its SHA-1 id.
@@ -359,7 +363,11 @@ pub async fn read_tree(fs: &dyn FileSystem, repo_path: &Path, oid: &str) -> Resu
 }
 
 /// Writes a commit object and returns its object id.
-pub async fn write_commit(fs: &dyn FileSystem, repo_path: &Path, commit: &Commit) -> Result<String> {
+pub async fn write_commit(
+    fs: &dyn FileSystem,
+    repo_path: &Path,
+    commit: &Commit,
+) -> Result<String> {
     write_object(fs, repo_path, ObjectKind::Commit, &commit.serialize()).await
 }
 

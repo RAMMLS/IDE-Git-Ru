@@ -68,12 +68,17 @@ impl Default for IndexFile {
 impl IndexFile {
     /// Inserts or replaces an entry while keeping the index sorted by path.
     pub fn upsert(&mut self, entry: IndexEntry) {
-        if let Some(slot) = self.entries.iter_mut().find(|existing| existing.path == entry.path) {
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|existing| existing.path == entry.path)
+        {
             *slot = entry;
         } else {
             self.entries.push(entry);
         }
-        self.entries.sort_by(|left, right| left.path.cmp(&right.path));
+        self.entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
     }
 
     /// Removes an entry by repository-relative path.
@@ -111,7 +116,12 @@ pub async fn save_index(fs: &dyn FileSystem, repo_path: &Path, index: &IndexFile
 }
 
 /// Builds an [`IndexEntry`] from filesystem metadata.
-pub fn entry_from_metadata(path: String, mode: u32, oid: String, metadata: &FsMetadata) -> IndexEntry {
+pub fn entry_from_metadata(
+    path: String,
+    mode: u32,
+    oid: String,
+    metadata: &FsMetadata,
+) -> IndexEntry {
     IndexEntry {
         path,
         mode,

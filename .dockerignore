@@ -1,0 +1,11 @@
+.git
+.gitignore
+.aura-server
+target
+**/target
+**/node_modules
+**/dist
+**/.vite
+.DS_Store
+*.log
+вывод.md

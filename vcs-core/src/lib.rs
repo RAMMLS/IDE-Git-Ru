@@ -19,8 +19,9 @@ pub mod refs;
 mod repository;
 
 pub use repository::{
-    ChangeKind, ChangeStats, CommitOutcome, CommitSummary, DiffLine, FileChangeStat, FileDiff,
-    PullStatus, PullSummary, PushSummary, RepositoryStatus, StatusEntry,
+    ChangeKind, ChangeStats, CommitOutcome, CommitSummary, DiffLine, FetchSummary, FileChangeStat,
+    FileDiff, MergeStatus, MergeSummary, PullStatus, PullSummary, PushSummary, RebaseStatus,
+    RebaseSummary, RepositoryStatus, StatusEntry,
 };
 
 /// Name of the metadata directory used by Aura repositories.
@@ -106,6 +107,9 @@ pub enum AuraError {
         /// Remote branch identifier.
         remote: String,
     },
+    /// A three-way merge or rebase detected overlapping edits.
+    #[error("conflicting changes in: {0}")]
+    ConflictingChanges(String),
     /// Checkout or pull cannot proceed while staged or unstaged tracked changes are present.
     #[error("working tree has staged or unstaged changes; commit or stash them before switching branches or pulling")]
     WorkingTreeNotClean,
@@ -219,7 +223,10 @@ impl FileSystem for TokioFileSystem {
             is_dir: metadata.is_dir(),
             len: metadata.len(),
             created: metadata.created().ok().map(FileTimestamp::from_system_time),
-            modified: metadata.modified().ok().map(FileTimestamp::from_system_time),
+            modified: metadata
+                .modified()
+                .ok()
+                .map(FileTimestamp::from_system_time),
         })
     }
 

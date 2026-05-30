@@ -1,0 +1,31 @@
+services:
+  aura-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: aura/server:local
+    environment:
+      AURA_STORAGE_ROOT: /data/aura
+      AURA_API_PORT: 3000
+    volumes:
+      - aura-repositories:/data/aura
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/repos"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  aura-web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: aura/web:local
+    depends_on:
+      - aura-server
+    ports:
+      - "8080:80"
+
+volumes:
+  aura-repositories:

@@ -1,76 +1,156 @@
-import { spawn } from 'child_process';
-import { mkdtemp, writeFile } from 'fs/promises';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import { rm } from 'fs/promises';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 
-async function run() {
-    console.log("=== Aura VCS E2E Tests ===");
-    
-    // Create a temporary directory for our test repository
-    const repoPath = await mkdtemp(join(tmpdir(), 'aura-test-'));
-    console.log(`[INFO] Created temporary test repository at: ${repoPath}`);
+const root = resolve(new URL('.', import.meta.url).pathname);
 
-    // Build the server first to ensure it's ready
-    console.log("[INFO] Building Rust server...");
-    await new Promise((resolve, reject) => {
-        const build = spawn('cargo', ['build', '--release', '--manifest-path', 'server/Cargo.toml']);
-        build.on('close', code => code === 0 ? resolve() : reject(new Error('Build failed')));
+function run(command, args, options = {}) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, {
+      cwd: root,
+      env: { ...process.env, ...options.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-
-    console.log("[INFO] Starting server...");
-    const server = spawn('server/target/release/aura-server', [], {
-        env: { ...process.env, AURA_REPO_PATH: repoPath }
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
     });
-
-    server.stdout.on('data', data => console.log(`[Server] ${data.toString().trim()}`));
-    server.stderr.on('data', data => console.error(`[Server ERR] ${data.toString().trim()}`));
-
-    // Wait for the server to spin up
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    try {
-        console.log("\n--- Test 1: Check initial status ---");
-        let res = await fetch('http://localhost:3000/api/repo/status');
-        let data = await res.json();
-        console.log('Response:', data);
-        if (data.branch !== 'main') throw new Error("Expected branch 'main'");
-
-        console.log("\n--- Test 2: Create a file and check status ---");
-        await writeFile(join(repoPath, 'hello.txt'), 'Hello Aura VCS!');
-        res = await fetch('http://localhost:3000/api/repo/status');
-        data = await res.json();
-        console.log('Response:', data);
-        if (!data.untracked.includes('hello.txt')) throw new Error("File should be untracked");
-
-        console.log("\n--- Test 3: Commit changes (auto-adds files) ---");
-        res = await fetch('http://localhost:3000/api/repo/commit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: 'Initial test commit' })
-        });
-        data = await res.json();
-        console.log('Response:', data);
-        if (!data.hash) throw new Error("No commit hash returned");
-        const commitHash = data.hash;
-
-        console.log("\n--- Test 4: Verify commit log ---");
-        res = await fetch('http://localhost:3000/api/repo/log');
-        data = await res.json();
-        console.log('Response:', data);
-        if (data.length === 0 || data[0].message !== 'Initial test commit') {
-            throw new Error("Commit not found in log");
-        }
-
-        console.log("\n✅ ALL TESTS PASSED SUCCESSFULLY!");
-    } catch (e) {
-        console.error("\n❌ TEST FAILED:", e.message);
-        process.exitCode = 1;
-    } finally {
-        console.log("\n[INFO] Cleaning up...");
-        server.kill();
-        await rm(repoPath, { recursive: true, force: true });
-    }
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolvePromise({ stdout, stderr });
+      } else {
+        reject(new Error(`${command} ${args.join(' ')} failed with ${code}\n${stdout}\n${stderr}`));
+      }
+    });
+  });
 }
 
-run();
+async function freePort() {
+  return new Promise((resolvePromise, reject) => {
+    const server = createServer();
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      server.close(() => resolvePromise(port));
+    });
+    server.on('error', reject);
+  });
+}
+
+async function waitForJson(url, attempts = 60) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return response.json();
+      }
+      lastError = new Error(`${response.status} ${await response.text()}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+  }
+  throw lastError ?? new Error(`Timed out waiting for ${url}`);
+}
+
+async function runAura(workspace, args) {
+  const aura = join(root, 'target', 'debug', process.platform === 'win32' ? 'aura.exe' : 'aura');
+  return run(aura, ['-C', workspace, ...args]);
+}
+
+async function main() {
+  console.log('=== Aura end-to-end test ===');
+
+  console.log('[build] compiling Aura CLI and Hub server');
+  await run('cargo', ['build', '-p', 'aura-control', '-p', 'aura-server']);
+
+  console.log('[build] compiling Aura Hub web dashboard');
+  await run('npm', ['--prefix', 'web', 'run', 'build']);
+
+  const tempRoot = await mkdtemp(join(tmpdir(), 'aura-e2e-'));
+  const storageRoot = join(tempRoot, 'hub-storage');
+  const ideWorkspace = join(tempRoot, 'ide-workspace');
+  const cloneWorkspace = join(tempRoot, 'clone-workspace');
+  const port = await freePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const transportUrl = `${baseUrl}/api/transport/repos/ide-demo`;
+  const serverBin = join(root, 'target', 'debug', process.platform === 'win32' ? 'aura-server.exe' : 'aura-server');
+
+  const server = spawn(serverBin, [], {
+    cwd: root,
+    env: {
+      ...process.env,
+      AURA_STORAGE_ROOT: storageRoot,
+      AURA_API_PORT: String(port),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server.stdout.on('data', (chunk) => process.stdout.write(`[server] ${chunk}`));
+  server.stderr.on('data', (chunk) => process.stderr.write(`[server] ${chunk}`));
+
+  try {
+    await waitForJson(`${baseUrl}/api/repos`);
+
+    console.log('[ide] initializing workspace and creating first commit through Aura commands used by IDE');
+    await mkdir(join(ideWorkspace, 'src'), { recursive: true });
+    await run(join(root, 'target', 'debug', process.platform === 'win32' ? 'aura.exe' : 'aura'), ['init', ideWorkspace]);
+    await writeFile(join(ideWorkspace, 'README.md'), '# Aura E2E\n\nCreated from the IDE source control flow.\n');
+    await writeFile(join(ideWorkspace, 'src', 'main.rs'), 'fn main() {\n    println!("hello aura");\n}\n');
+    await runAura(ideWorkspace, ['add', '-A']);
+    await runAura(ideWorkspace, ['commit', '-m', 'IDE initial commit']);
+
+    console.log('[sync] pushing committed workspace to Aura Hub transport endpoint');
+    await runAura(ideWorkspace, ['remote', 'add', 'origin', transportUrl]);
+    await runAura(ideWorkspace, ['push', 'origin', 'main']);
+
+    console.log('[hub] verifying repository, commits and code browsing APIs');
+    const repos = await waitForJson(`${baseUrl}/api/repos`);
+    if (!repos.some((repo) => repo.id === 'ide-demo' && repo.storage === 'hosted')) {
+      throw new Error(`Expected hosted ide-demo repo, got ${JSON.stringify(repos)}`);
+    }
+
+    const log = await waitForJson(`${baseUrl}/api/repo/log?repo=ide-demo`);
+    if (!Array.isArray(log) || log[0]?.message !== 'IDE initial commit') {
+      throw new Error(`Expected pushed commit in Aura Hub log, got ${JSON.stringify(log)}`);
+    }
+
+    const tree = await waitForJson(`${baseUrl}/api/repo/tree?repo=ide-demo`);
+    if (!tree.some((entry) => entry.path === 'README.md') || !tree.some((entry) => entry.path === 'src')) {
+      throw new Error(`Expected README.md and src in tree, got ${JSON.stringify(tree)}`);
+    }
+
+    const file = await waitForJson(`${baseUrl}/api/repo/file?repo=ide-demo&path=src/main.rs`);
+    if (!file.content.includes('hello aura')) {
+      throw new Error(`Expected source file content from web code API, got ${JSON.stringify(file)}`);
+    }
+
+    console.log('[clone] cloning from Aura Hub transport endpoint into another folder');
+    await run(join(root, 'target', 'debug', process.platform === 'win32' ? 'aura.exe' : 'aura'), [
+      'clone',
+      transportUrl,
+      cloneWorkspace,
+    ]);
+    const clonedReadme = await readFile(join(cloneWorkspace, 'README.md'), 'utf8');
+    if (!clonedReadme.includes('Aura E2E')) {
+      throw new Error('Cloned repository does not contain expected README.md');
+    }
+
+    console.log('E2E passed: IDE flow -> commit -> push -> Aura Hub API/web data -> clone.');
+  } finally {
+    server.kill('SIGTERM');
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

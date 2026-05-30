@@ -2,7 +2,6 @@
 /target/
 **/target/
 **/*.rs.bk
-Cargo.lock
 
 # macOS
 .DS_Store
@@ -16,7 +15,6 @@ Thumbs.db
 *~
 
 # Frontend
-web/
-client/node_modules/
-client/dist/
-
+web/node_modules/
+web/dist/
+web/.vite/

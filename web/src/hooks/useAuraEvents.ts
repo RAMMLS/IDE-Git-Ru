@@ -29,6 +29,10 @@ export function useAuraEvents() {
           queryClient.invalidateQueries({ queryKey: ['branches'] });
           queryClient.invalidateQueries({ queryKey: ['remotes'] });
           queryClient.invalidateQueries({ queryKey: ['diff'] });
+          queryClient.invalidateQueries({ queryKey: ['tree'] });
+          queryClient.invalidateQueries({ queryKey: ['file'] });
+          queryClient.invalidateQueries({ queryKey: ['issues'] });
+          queryClient.invalidateQueries({ queryKey: ['pull-requests'] });
         }
       } catch (err) {
         console.error('Failed to parse websocket message', err);

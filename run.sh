@@ -1,40 +1,47 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=== Aura VCS Setup & Deploy ==="
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AURA_STORAGE_ROOT="${AURA_STORAGE_ROOT:-$ROOT_DIR/.aura-server}"
+AURA_API_PORT="${AURA_API_PORT:-3000}"
+AURA_WEB_PORT="${AURA_WEB_PORT:-5173}"
 
-echo "[1/2] Installing dependencies..."
-# Установка зависимостей клиента
-cd client
-npm install
-cd ..
+cd "$ROOT_DIR"
 
-# Сборка Rust компонентов
-echo "Building Rust components..."
-cargo build --release --manifest-path vcs-core/Cargo.toml
-cargo build --release --manifest-path server/Cargo.toml
+echo "=== Aura Hub dev stack ==="
+echo "storage: $AURA_STORAGE_ROOT"
 
-echo "[2/2] Starting services..."
-# Запуск Rust сервера
-cd server
-cargo run --release &
+if [ ! -d web/node_modules ]; then
+  echo "[setup] installing web dependencies"
+  npm --prefix web install
+fi
+
+echo "[build] compiling Aura Rust workspace"
+cargo build --workspace
+
+echo "[run] starting Aura Hub API on :$AURA_API_PORT"
+AURA_STORAGE_ROOT="$AURA_STORAGE_ROOT" AURA_API_PORT="$AURA_API_PORT" cargo run -p aura-server &
 SERVER_PID=$!
-cd ..
 
-# Запуск React клиента
-cd client
-npm run dev &
-CLIENT_PID=$!
-cd ..
+echo "[run] starting Aura web UI on :$AURA_WEB_PORT"
+VITE_AURA_API_URL="http://localhost:$AURA_API_PORT/api" \
+  npm --prefix web run dev -- --host 0.0.0.0 --port "$AURA_WEB_PORT" &
+WEB_PID=$!
 
-echo "==================================="
-echo "Aura VCS is running!"
-echo "Client: http://localhost:5000"
-echo "Server: http://localhost:3000"
-echo "Press Ctrl+C to stop."
-echo "==================================="
+cleanup() {
+  echo
+  echo "Stopping Aura services..."
+  kill "$SERVER_PID" "$WEB_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
-# Корректное завершение процессов при нажатии Ctrl+C
-trap "echo 'Stopping services...'; kill $SERVER_PID $CLIENT_PID; exit" SIGINT SIGTERM
+cat <<EOF
 
-wait $SERVER_PID $CLIENT_PID
+Aura is running:
+  Web UI: http://localhost:$AURA_WEB_PORT
+  API:    http://localhost:$AURA_API_PORT/api
+
+Press Ctrl+C to stop.
+EOF
+
+wait "$SERVER_PID" "$WEB_PID"

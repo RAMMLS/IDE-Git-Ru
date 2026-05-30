@@ -16,6 +16,15 @@ function repoParams(repoId?: string) {
   return repoId ? { params: { repo: repoId } } : undefined;
 }
 
+function withRepoParams(repoId?: string, params: Record<string, string | undefined> = {}) {
+  return {
+    params: {
+      ...(repoId ? { repo: repoId } : {}),
+      ...Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined && value !== '')),
+    },
+  };
+}
+
 export interface Commit {
   hash: string;
   author: string;
@@ -35,6 +44,21 @@ export interface Status {
   untracked: string[];
   branch: string;
   head?: string | null;
+}
+
+export interface TreeEntry {
+  name: string;
+  path: string;
+  kind: 'dir' | 'file';
+  oid: string;
+  size?: number | null;
+}
+
+export interface RepoFile {
+  path: string;
+  oid: string;
+  language: string;
+  content: string;
 }
 
 export interface RemoteConfig {
@@ -86,6 +110,20 @@ export interface RepoUpsertPayload {
   path?: string;
 }
 
+export interface HubItem {
+  id: number;
+  title: string;
+  body: string;
+  status: 'open' | 'closed';
+  author: string;
+  created_at: number;
+}
+
+export interface HubItemPayload {
+  title: string;
+  body?: string;
+}
+
 export const api = {
   listRepos: async () => {
     const { data } = await apiClient.get<RepoRecord[]>('/repos');
@@ -101,6 +139,14 @@ export const api = {
   },
   getCommitDiff: async (hash: string, repoId?: string) => {
     const { data } = await apiClient.get<FileDiff[]>(`/repo/diff/${hash}`, repoParams(repoId));
+    return data;
+  },
+  getTree: async (repoId?: string, path?: string, rev?: string) => {
+    const { data } = await apiClient.get<TreeEntry[]>('/repo/tree', withRepoParams(repoId, { path, rev }));
+    return data;
+  },
+  getFile: async (repoId: string | undefined, path: string, rev?: string) => {
+    const { data } = await apiClient.get<RepoFile>('/repo/file', withRepoParams(repoId, { path, rev }));
     return data;
   },
   getStatus: async (repoId?: string) => {
@@ -133,6 +179,22 @@ export const api = {
   },
   pull: async (payload: { remote?: string; branch?: string }, repoId?: string) => {
     const { data } = await apiClient.post<PullSummary>('/repo/pull', payload, repoParams(repoId));
+    return data;
+  },
+  getIssues: async (repoId?: string) => {
+    const { data } = await apiClient.get<HubItem[]>('/repo/issues', repoParams(repoId));
+    return data;
+  },
+  createIssue: async (payload: HubItemPayload, repoId?: string) => {
+    const { data } = await apiClient.post<HubItem>('/repo/issues', payload, repoParams(repoId));
+    return data;
+  },
+  getPullRequests: async (repoId?: string) => {
+    const { data } = await apiClient.get<HubItem[]>('/repo/pull-requests', repoParams(repoId));
+    return data;
+  },
+  createPullRequest: async (payload: HubItemPayload, repoId?: string) => {
+    const { data } = await apiClient.post<HubItem>('/repo/pull-requests', payload, repoParams(repoId));
     return data;
   },
 };

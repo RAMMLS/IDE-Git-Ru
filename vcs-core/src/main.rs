@@ -17,16 +17,51 @@ struct Cli {
 
 #[derive(Debug)]
 enum Command {
-    Init { path: Option<PathBuf> },
-    Add { paths: Vec<PathBuf>, all: bool },
-    Commit { message: String },
+    Init {
+        path: Option<PathBuf>,
+    },
+    Add {
+        paths: Vec<PathBuf>,
+        all: bool,
+    },
+    Commit {
+        message: String,
+    },
     Status,
     Log,
-    Checkout { branch: String },
-    Branch { name: Option<String> },
-    RemoteAdd { name: String, target: String },
-    Push { remote: Option<String>, branch: Option<String> },
-    Pull { remote: Option<String>, branch: Option<String> },
+    Clone {
+        remote: String,
+        path: Option<PathBuf>,
+        branch: Option<String>,
+    },
+    Fetch {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+    Checkout {
+        branch: String,
+    },
+    Branch {
+        name: Option<String>,
+    },
+    Merge {
+        source: String,
+    },
+    Rebase {
+        upstream: String,
+    },
+    RemoteAdd {
+        name: String,
+        target: String,
+    },
+    Push {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+    Pull {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
     Diff,
     Help,
 }
@@ -67,7 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Init { path } => {
             let root = path
                 .map(|value| resolve_from_base(&current_dir, &value))
-                .or_else(|| cli.repo.as_ref().map(|value| resolve_from_base(&current_dir, value)))
+                .or_else(|| {
+                    cli.repo
+                        .as_ref()
+                        .map(|value| resolve_from_base(&current_dir, value))
+                })
                 .unwrap_or(current_dir.clone());
             Repository::init(&root).await?;
             println!("Initialized Aura repository at {}", root.display());
@@ -112,6 +151,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Clone {
+            remote,
+            path,
+            branch,
+        } => {
+            let target = run_clone(&current_dir, &remote, path.as_ref(), branch.as_deref()).await?;
+            println!("Cloned `{remote}` into {}", target.display());
+        }
+        Command::Fetch { remote, branch } => {
+            let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
+            let (remote, branch) = resolve_push_target(&repo, remote, branch).await?;
+            let remote_name = remote.clone().unwrap_or_else(|| "origin".to_string());
+            if let Some(target) =
+                refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await?
+            {
+                if is_http_remote(&target) {
+                    let summary =
+                        http_fetch(&repo, &remote_name, &target, branch.as_deref()).await?;
+                    println!(
+                        "Fetched `{}/{}` at {}",
+                        summary.remote,
+                        summary.branch,
+                        short_oid(&summary.oid)
+                    );
+                    return Ok(());
+                }
+            }
+            let summary = repo.fetch(remote.as_deref(), branch.as_deref()).await?;
+            println!(
+                "Fetched `{}/{}` at {}",
+                summary.remote,
+                summary.branch,
+                short_oid(&summary.oid)
+            );
+        }
         Command::Checkout { branch } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
             match repo.checkout(&branch).await {
@@ -154,6 +228,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Merge { source } => {
+            let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
+            let summary = repo.merge(&source).await?;
+            print_merge_summary(&summary);
+        }
+        Command::Rebase { upstream } => {
+            let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
+            let summary = repo.rebase(&upstream).await?;
+            print_rebase_summary(&summary);
+        }
         Command::RemoteAdd { name, target } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
             let stored_target = normalize_remote_target(cli.repo.as_ref(), &current_dir, &target);
@@ -164,9 +248,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
             let (remote, branch) = resolve_push_target(&repo, remote, branch).await?;
             let remote_name = remote.clone().unwrap_or_else(|| "origin".to_string());
-            if let Some(target) = refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await? {
+            if let Some(target) =
+                refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await?
+            {
                 if is_http_remote(&target) {
-                    let summary = http_push(&repo, &remote_name, &target, branch.as_deref()).await?;
+                    let summary =
+                        http_push(&repo, &remote_name, &target, branch.as_deref()).await?;
                     println!(
                         "Pushed branch `{}` to `{}` at {} ({})",
                         summary.branch,
@@ -199,9 +286,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pull { remote, branch } => {
             let repo = open_repo(cli.repo.as_ref(), &current_dir).await?;
             let remote_name = remote.clone().unwrap_or_else(|| "origin".to_string());
-            if let Some(target) = refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await? {
+            if let Some(target) =
+                refs::read_remote(repo.filesystem(), &repo.path, &remote_name).await?
+            {
                 if is_http_remote(&target) {
-                    let summary = http_pull(&repo, &remote_name, &target, branch.as_deref()).await?;
+                    let summary =
+                        http_pull(&repo, &remote_name, &target, branch.as_deref()).await?;
                     print_pull_summary(&summary);
                     return Ok(());
                 }
@@ -218,7 +308,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!("В remote `{remote}` нет ветки `{branch}`.").into());
                 }
                 Err(AuraError::WorkingTreeNotClean) => {
-                    return Err("Перед `aura pull` закоммить или убери staged/unstaged изменения.".into());
+                    return Err(
+                        "Перед `aura pull` закоммить или убери staged/unstaged изменения.".into(),
+                    );
                 }
                 Err(AuraError::UntrackedWouldBeOverwritten(path)) => {
                     return Err(format!(
@@ -260,6 +352,88 @@ async fn open_repo(
         )
     })?;
     Ok(Repository::new(root))
+}
+
+async fn run_clone(
+    current_dir: &Path,
+    remote: &str,
+    destination: Option<&PathBuf>,
+    branch: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let target = match destination {
+        Some(path) => resolve_from_base(current_dir, path),
+        None => current_dir.join(default_clone_directory(remote)),
+    };
+    ensure_clone_destination(&target)?;
+
+    let repo = Repository::init(&target).await?;
+    if is_http_remote(remote) {
+        let target_url = remote.trim_end_matches('/').to_string();
+        repo.add_remote("origin", target_url.clone()).await?;
+        let summary = http_fetch(&repo, "origin", &target_url, branch).await?;
+        refs::write_branch(repo.filesystem(), &repo.path, &summary.branch, &summary.oid).await?;
+        repo.materialize_branch(&summary.branch).await?;
+        return Ok(target);
+    }
+
+    let source_path = resolve_from_base(current_dir, Path::new(remote));
+    let source = Repository::new(&source_path);
+    if !source.filesystem().exists(&source.aura_dir()).await? {
+        return Err(format!(
+            "Remote `{}` is not an Aura repository",
+            source_path.display()
+        )
+        .into());
+    }
+
+    let branch_name = match branch {
+        Some(branch) => branch.to_string(),
+        None => default_clone_branch(&source).await?,
+    };
+    repo.add_remote("origin", source_path).await?;
+    let summary = repo.fetch(Some("origin"), Some(&branch_name)).await?;
+    refs::write_branch(repo.filesystem(), &repo.path, &summary.branch, &summary.oid).await?;
+    repo.materialize_branch(&summary.branch).await?;
+    Ok(target)
+}
+
+fn ensure_clone_destination(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !target.exists() {
+        return Ok(());
+    }
+
+    let mut entries = std::fs::read_dir(target)?;
+    if entries.next().is_none() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Destination `{}` already exists and is not empty",
+            target.display()
+        )
+        .into())
+    }
+}
+
+async fn default_clone_branch(repo: &Repository) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(branch) = refs::current_branch(repo.filesystem(), &repo.path).await? {
+        return Ok(branch);
+    }
+
+    let branches = refs::list_branches(repo.filesystem(), &repo.path).await?;
+    branches
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Remote repository has no branches".into())
+}
+
+fn default_clone_directory(remote: &str) -> String {
+    let value = remote.trim_end_matches('/');
+    let leaf = value
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("aura-clone");
+    leaf.strip_suffix(".aura").unwrap_or(leaf).to_string()
 }
 
 async fn resolve_push_target(
@@ -346,6 +520,51 @@ async fn http_push(
     })
 }
 
+async fn http_fetch(
+    repo: &Repository,
+    remote_name: &str,
+    target: &str,
+    branch: Option<&str>,
+) -> Result<aura_control::FetchSummary, Box<dyn std::error::Error>> {
+    let requested_branch = match branch {
+        Some(branch) => branch.to_string(),
+        None => refs::current_branch(repo.filesystem(), &repo.path)
+            .await?
+            .unwrap_or_else(|| "main".to_string()),
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{target}/export"))
+        .query(&[("branch", requested_branch.as_str())])
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP fetch failed: {}", response.text().await?).into());
+    }
+
+    let pack: TransportPack = response.json().await?;
+    for object in &pack.objects {
+        write_transport_object(repo, object).await?;
+    }
+    refs::write_remote_branch(
+        repo.filesystem(),
+        &repo.path,
+        remote_name,
+        &pack.branch,
+        &pack.oid,
+    )
+    .await?;
+
+    Ok(aura_control::FetchSummary {
+        remote: remote_name.to_string(),
+        branch: pack.branch,
+        oid: pack.oid,
+        target: PathBuf::from(target),
+    })
+}
+
 async fn http_pull(
     repo: &Repository,
     remote_name: &str,
@@ -390,7 +609,8 @@ async fn http_pull(
     temp_remote.materialize_branch(&pack.branch).await?;
 
     let temp_remote_name = format!("http-{remote_name}");
-    repo.add_remote(&temp_remote_name, &temp_remote_path).await?;
+    repo.add_remote(&temp_remote_name, &temp_remote_path)
+        .await?;
     let summary = repo
         .pull(Some(temp_remote_name.as_str()), Some(pack.branch.as_str()))
         .await?;
@@ -582,8 +802,13 @@ fn parse_cli() -> Result<Cli, String> {
                         all: true,
                     }
                 } else {
-                    if parts.iter().any(|part| matches!(part.as_str(), "-A" | "--all")) {
-                        return Err("Используй либо `aura add -A`, либо `aura add <PATH>...`".to_string());
+                    if parts
+                        .iter()
+                        .any(|part| matches!(part.as_str(), "-A" | "--all"))
+                    {
+                        return Err(
+                            "Используй либо `aura add -A`, либо `aura add <PATH>...`".to_string()
+                        );
                     }
                     Command::Add {
                         paths: parts.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
@@ -609,10 +834,9 @@ fn parse_cli() -> Result<Cli, String> {
                         },
                     });
                 }
-                if parts
-                    .first()
-                    .is_some_and(|part| part.starts_with('-') && part != "-m" && part != "--message")
-                {
+                if parts.first().is_some_and(|part| {
+                    part.starts_with('-') && part != "-m" && part != "--message"
+                }) {
                     return Err(format!("Неизвестный флаг для `commit`: `{}`", parts[0]));
                 }
                 Command::Commit {
@@ -621,6 +845,32 @@ fn parse_cli() -> Result<Cli, String> {
             }
             "status" => Command::Status,
             "log" => Command::Log,
+            "clone" => parse_clone_command(args.collect::<Vec<_>>())?,
+            "fetch" => {
+                let parts = args
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                match parts.len() {
+                    0 => Command::Fetch {
+                        remote: None,
+                        branch: None,
+                    },
+                    1 => Command::Fetch {
+                        remote: Some(parts[0].clone()),
+                        branch: None,
+                    },
+                    2 => Command::Fetch {
+                        remote: Some(parts[0].clone()),
+                        branch: Some(parts[1].clone()),
+                    },
+                    _ => {
+                        return Err(
+                            "Команда `fetch` поддерживает формы `aura fetch`, `aura fetch <REMOTE>` и `aura fetch <REMOTE> <BRANCH>`"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
             "checkout" | "switch" => {
                 let branch = args
                     .next()
@@ -632,20 +882,44 @@ fn parse_cli() -> Result<Cli, String> {
             "branch" => Command::Branch {
                 name: args.next().map(|arg| arg.to_string_lossy().into_owned()),
             },
-            "remote" => {
-                let action = args
+            "merge" => {
+                let source = args
                     .next()
-                    .ok_or_else(|| "Команда `remote` требует подкоманду, например `add`".to_string())?;
+                    .ok_or_else(|| "Команда `merge` требует ветку или ref".to_string())?;
+                if args.next().is_some() {
+                    return Err("Команда `merge` принимает только один ref".to_string());
+                }
+                Command::Merge {
+                    source: source.to_string_lossy().into_owned(),
+                }
+            }
+            "rebase" => {
+                let upstream = args
+                    .next()
+                    .ok_or_else(|| "Команда `rebase` требует upstream ref".to_string())?;
+                if args.next().is_some() {
+                    return Err("Команда `rebase` принимает только один upstream ref".to_string());
+                }
+                Command::Rebase {
+                    upstream: upstream.to_string_lossy().into_owned(),
+                }
+            }
+            "remote" => {
+                let action = args.next().ok_or_else(|| {
+                    "Команда `remote` требует подкоманду, например `add`".to_string()
+                })?;
                 match action.to_string_lossy().as_ref() {
                     "add" => {
                         let name = args
                             .next()
                             .ok_or_else(|| "Команда `remote add` требует имя remote".to_string())?;
-                        let target = args
-                            .next()
-                            .ok_or_else(|| "Команда `remote add` требует путь к remote-репозиторию".to_string())?;
+                        let target = args.next().ok_or_else(|| {
+                            "Команда `remote add` требует путь к remote-репозиторию".to_string()
+                        })?;
                         if args.next().is_some() {
-                            return Err("Команда `remote add` принимает только имя и путь".to_string());
+                            return Err(
+                                "Команда `remote add` принимает только имя и путь".to_string()
+                            );
                         }
                         Command::RemoteAdd {
                             name: name.to_string_lossy().into_owned(),
@@ -716,6 +990,45 @@ fn parse_cli() -> Result<Cli, String> {
     Ok(Cli { repo, command })
 }
 
+fn parse_clone_command(parts: Vec<std::ffi::OsString>) -> Result<Command, String> {
+    let mut branch = None::<String>;
+    let mut positional = Vec::new();
+    let mut iter = parts.into_iter();
+
+    while let Some(part) = iter.next() {
+        let value = part.to_string_lossy().into_owned();
+        match value.as_str() {
+            "-b" | "--branch" => {
+                let branch_value = iter
+                    .next()
+                    .ok_or_else(|| "Флаг `clone --branch` требует имя ветки".to_string())?;
+                branch = Some(branch_value.to_string_lossy().into_owned());
+            }
+            _ if value.starts_with('-') => {
+                return Err(format!("Неизвестный флаг для `clone`: `{value}`"));
+            }
+            _ => positional.push(PathBuf::from(value)),
+        }
+    }
+
+    if positional.is_empty() {
+        return Err("Команда `clone` требует remote URL или путь".to_string());
+    }
+    if positional.len() > 2 {
+        return Err(
+            "Команда `clone` принимает remote и необязательный путь назначения".to_string(),
+        );
+    }
+
+    let remote = positional[0].to_string_lossy().into_owned();
+    let path = positional.get(1).cloned();
+    Ok(Command::Clone {
+        remote,
+        path,
+        branch,
+    })
+}
+
 fn print_usage() {
     println!("Aura Control CLI");
     println!();
@@ -729,9 +1042,14 @@ fn print_usage() {
     println!("  commit [-m] <MESSAGE>    Create a commit from the current index");
     println!("  status                   Show staged, unstaged and untracked files");
     println!("  log                      Show commit history");
+    println!("  clone [-b BR] <REMOTE> [PATH]");
+    println!("                           Clone a local path or HTTP Aura remote");
+    println!("  fetch [REMOTE] [BRANCH]  Fetch objects into remote-tracking refs");
     println!("  branch [NAME]            List branches or create a new branch");
     println!("  checkout <NAME>          Switch to an existing branch");
     println!("  switch <NAME>            Alias for checkout");
+    println!("  merge <REF>              Merge a branch/ref into the current branch");
+    println!("  rebase <REF>             Replay current branch on top of a branch/ref");
     println!("  remote add <N> <TARGET>  Configure a local path or HTTP Aura remote");
     println!("  push [REMOTE] [BRANCH]   Push to a configured remote");
     println!("  pull [REMOTE] [BRANCH]   Pull from a configured remote");
@@ -747,9 +1065,13 @@ fn print_usage() {
     println!("  aura add -A");
     println!("  aura -C ..\\demo-repo commit -m initial snapshot");
     println!("  aura --repo ..\\demo-repo status");
+    println!("  aura clone http://localhost:3000/api/transport/repos/demo demo");
     println!("  aura branch feature");
     println!("  aura switch feature");
+    println!("  aura merge main");
+    println!("  aura rebase main");
     println!("  aura remote add origin ..\\demo-remote");
+    println!("  aura fetch origin main");
     println!("  aura push");
     println!("  aura push main");
     println!("  aura push origin main");
@@ -838,12 +1160,68 @@ fn print_pull_summary(summary: &aura_control::PullSummary) {
         }
         PullStatus::FastForward => {
             println!("From {} ({})", summary.remote, summary.target.display());
-            let from = summary.previous_oid.as_deref().map(short_oid).unwrap_or("(empty)");
+            let from = summary
+                .previous_oid
+                .as_deref()
+                .map(short_oid)
+                .unwrap_or("(empty)");
             println!("Updating {}..{}", from, short_oid(&summary.oid));
             println!("Fast-forward");
             if let Some(stats) = &summary.stats {
                 print_change_stats(stats);
             }
+        }
+    }
+}
+
+fn print_merge_summary(summary: &aura_control::MergeSummary) {
+    match summary.status {
+        aura_control::MergeStatus::AlreadyUpToDate => println!("Already up to date."),
+        aura_control::MergeStatus::FastForward => {
+            println!(
+                "Updating {}..{}",
+                short_oid(&summary.previous_oid),
+                short_oid(&summary.oid)
+            );
+            println!("Fast-forward");
+            if let Some(stats) = &summary.stats {
+                print_change_stats(stats);
+            }
+        }
+        aura_control::MergeStatus::Merged => {
+            println!(
+                "Merge made commit {} into `{}` from `{}`.",
+                short_oid(&summary.oid),
+                summary.local_branch,
+                summary.source
+            );
+            if let Some(stats) = &summary.stats {
+                print_change_stats(stats);
+            }
+        }
+    }
+}
+
+fn print_rebase_summary(summary: &aura_control::RebaseSummary) {
+    match summary.status {
+        aura_control::RebaseStatus::AlreadyUpToDate => {
+            println!("Current branch is already up to date.")
+        }
+        aura_control::RebaseStatus::FastForward => {
+            println!(
+                "Fast-forwarded `{}` to {}.",
+                summary.local_branch,
+                short_oid(&summary.oid)
+            );
+        }
+        aura_control::RebaseStatus::Rebased => {
+            println!(
+                "Successfully rebased `{}` onto `{}` ({} replayed). New HEAD {}.",
+                summary.local_branch,
+                summary.upstream,
+                summary.replayed,
+                short_oid(&summary.oid)
+            );
         }
     }
 }

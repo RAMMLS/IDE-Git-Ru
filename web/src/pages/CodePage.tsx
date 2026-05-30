@@ -1,131 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ChevronRight, Code2, File, Folder, GitBranch, History } from 'lucide-react';
+import { ChevronRight, CircleDot, Code2, GitBranch, GitCommit, History, Layers3 } from 'lucide-react';
 import { api, type TreeEntry } from '@/api/client';
+import { CodeViewer } from '@/components/repository/CodeViewer';
+import { FileExplorer } from '@/components/repository/FileExplorer';
 import { useRepoContext } from '@/components/providers/repo-context';
-import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
 
 function parentPath(path: string) {
   const parts = path.split('/').filter(Boolean);
   parts.pop();
   return parts.join('/');
-}
-
-function formatBytes(size?: number | null) {
-  if (!size) {
-    return '';
-  }
-  if (size < 1024) {
-    return `${size} B`;
-  }
-  return `${(size / 1024).toFixed(1)} KB`;
-}
-
-function lineTokens(line: string, language: string) {
-  const keywords = new Set([
-    'async',
-    'await',
-    'const',
-    'enum',
-    'fn',
-    'function',
-    'if',
-    'impl',
-    'import',
-    'interface',
-    'let',
-    'match',
-    'mod',
-    'pub',
-    'return',
-    'struct',
-    'type',
-    'use',
-  ]);
-  const pattern = /(\/\/.*|#.*|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)/g;
-  const nodes: ReactNode[] = [];
-  let lastIndex = 0;
-
-  for (const match of line.matchAll(pattern)) {
-    const token = match[0];
-    const index = match.index ?? 0;
-    if (index > lastIndex) {
-      nodes.push(line.slice(lastIndex, index));
-    }
-
-    let className = '';
-    if (token.startsWith('//') || (language === 'python' && token.startsWith('#'))) {
-      className = 'text-[#6e7781]';
-    } else if (token.startsWith('"') || token.startsWith("'")) {
-      className = 'text-[#0a3069]';
-    } else if (/^\d/.test(token)) {
-      className = 'text-[#0550ae]';
-    } else if (keywords.has(token)) {
-      className = 'text-[#cf222e] font-medium';
-    } else if (/^[A-Z]/.test(token)) {
-      className = 'text-[#8250df]';
-    }
-
-    nodes.push(
-      className ? (
-        <span key={`${index}-${token}`} className={className}>
-          {token}
-        </span>
-      ) : (
-        token
-      ),
-    );
-    lastIndex = index + token.length;
-  }
-
-  if (lastIndex < line.length) {
-    nodes.push(line.slice(lastIndex));
-  }
-  return nodes.length ? nodes : ' ';
-}
-
-function FileViewer({ repoId, path, rev }: { repoId: string; path: string; rev?: string }) {
-  const fileQuery = useQuery({
-    queryKey: ['file', repoId, path, rev],
-    queryFn: () => api.getFile(repoId, path, rev),
-    enabled: !!repoId && !!path,
-  });
-
-  if (fileQuery.isLoading) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading file...</div>;
-  }
-
-  if (!fileQuery.data) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a file to preview.</div>;
-  }
-
-  const lines = fileQuery.data.content.split('\n');
-
-  return (
-    <div className="overflow-hidden rounded-md border bg-card">
-      <div className="flex items-center justify-between border-b bg-muted/40 px-4 py-2">
-        <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-          <File className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span className="truncate">{fileQuery.data.path}</span>
-        </div>
-        <span className="font-mono text-xs text-muted-foreground">{fileQuery.data.oid.slice(0, 7)}</span>
-      </div>
-      <ScrollArea className="max-h-[58vh]">
-        <pre className="min-w-full bg-white text-[13px] leading-5 text-[#24292f]">
-          {lines.map((line, index) => (
-            <div key={index} className="grid grid-cols-[64px_1fr] hover:bg-[#f6f8fa]">
-              <span className="select-none border-r bg-[#f6f8fa] px-4 text-right text-[#6e7781]">
-                {index + 1}
-              </span>
-              <code className="whitespace-pre px-4">{lineTokens(line, fileQuery.data.language)}</code>
-            </div>
-          ))}
-        </pre>
-      </ScrollArea>
-    </div>
-  );
 }
 
 export function CodePage() {
@@ -138,6 +22,7 @@ export function CodePage() {
     queryKey: ['status', selectedRepoId],
     queryFn: () => api.getStatus(selectedRepoId ?? undefined),
     enabled: !!selectedRepoId,
+    retry: false,
   });
   const branchesQuery = useQuery({
     queryKey: ['branches', selectedRepoId],
@@ -164,125 +49,185 @@ export function CodePage() {
     setRev('');
   }, [selectedRepoId]);
 
-  const activeRev = rev || statusQuery.data?.branch || 'main';
+  const activeRev = rev || statusQuery.data?.branch || branchesQuery.data[0] || 'main';
   const latestCommit = commitsQuery.data[0];
   const crumbs = useMemo(() => path.split('/').filter(Boolean), [path]);
 
+  const sortedEntries = useMemo<TreeEntry[]>(() => {
+    const entries = treeQuery.data ?? [];
+    const folders = entries.filter((entry) => entry.kind === 'dir');
+    const files = entries.filter((entry) => entry.kind === 'file');
+    return [...folders, ...files];
+  }, [treeQuery.data]);
+
+  useEffect(() => {
+    if (!sortedEntries.length) {
+      setSelectedFile('');
+      return;
+    }
+
+    if (selectedFile && sortedEntries.some((entry) => entry.path === selectedFile)) {
+      return;
+    }
+
+    const preferredFile =
+      sortedEntries.find((entry) => entry.kind === 'file' && entry.name.toLowerCase().startsWith('readme')) ??
+      sortedEntries.find((entry) => entry.kind === 'file');
+
+    setSelectedFile(preferredFile?.path ?? '');
+  }, [selectedFile, sortedEntries]);
+
   if (!selectedRepoId) {
-    return <div className="p-8 text-muted-foreground">Create or select a repository in Source Control.</div>;
+    return (
+      <div className="mx-auto flex h-full max-w-6xl items-center justify-center p-6">
+        <div className="w-full max-w-xl rounded-2xl border border-dashed border-[#d0d7de] bg-white p-10 text-center shadow-sm">
+          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-[#ddf4ff] text-[#0969da]">
+            <Code2 className="h-6 w-6" />
+          </div>
+          <h1 className="mt-5 text-2xl font-semibold text-[#24292f]">Open a repository to browse code</h1>
+          <p className="mt-2 text-sm text-[#57606a]">
+            Create or register a repository in `Source Control`, then Aura Hub will render the file tree,
+            branches, commits and source preview here.
+          </p>
+        </div>
+      </div>
+    );
   }
 
-  const entries = treeQuery.data ?? [];
-  const folders = entries.filter((entry) => entry.kind === 'dir');
-  const files = entries.filter((entry) => entry.kind === 'file');
-  const sortedEntries: TreeEntry[] = [...folders, ...files];
-
   return (
-    <div className="mx-auto flex h-full max-w-6xl flex-col gap-4 p-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-semibold">{selectedRepo?.name}</h1>
-          <div className="mt-1 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
-            <span>{selectedRepo?.storage === 'hosted' ? 'Hosted Aura repository' : 'Linked repository'}</span>
-            {latestCommit && (
-              <span className="inline-flex items-center gap-1">
-                <History className="h-4 w-4" />
-                {latestCommit.message}
-              </span>
-            )}
-          </div>
-        </div>
-        <label className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm">
-          <GitBranch className="h-4 w-4 text-muted-foreground" />
-          <select
-            className="bg-transparent outline-none"
-            value={activeRev}
-            onChange={(event) => setRev(event.target.value)}
-          >
-            {branchesQuery.data.map((branch) => (
-              <option key={branch} value={branch}>
-                {branch}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+    <div className="min-h-full bg-[#f6f8fa]">
+      <div className="mx-auto flex max-w-7xl flex-col gap-6 px-6 py-6">
+        <section className="rounded-2xl border border-[#d0d7de] bg-white p-6 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="truncate text-2xl font-semibold text-[#24292f]">{selectedRepo?.name}</h1>
+                <span className="rounded-full border border-[#d8dee4] bg-[#f6f8fa] px-2.5 py-1 text-xs text-[#57606a]">
+                  {selectedRepo?.storage === 'hosted' ? 'Hosted on Aura Hub' : 'Linked workspace'}
+                </span>
+              </div>
+              <p className="mt-2 text-sm text-[#57606a]">{selectedRepo?.path}</p>
+            </div>
 
-      <div className="flex flex-wrap items-center gap-1 rounded-md border bg-[#f6f8fa] px-3 py-2 text-sm">
-        <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setPath('')}>
-          {selectedRepo?.name}
-        </Button>
-        {crumbs.map((crumb, index) => {
-          const nextPath = crumbs.slice(0, index + 1).join('/');
-          return (
-            <span key={nextPath} className="inline-flex items-center gap-1">
-              <ChevronRight className="h-4 w-4 text-muted-foreground" />
-              <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setPath(nextPath)}>
-                {crumb}
-              </Button>
-            </span>
-          );
-        })}
-      </div>
-
-      <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[minmax(320px,420px)_1fr]">
-        <div className="overflow-hidden rounded-md border bg-card">
-          <div className="border-b bg-[#f6f8fa] px-4 py-2 text-sm font-medium">
-            {latestCommit ? (
-              <span className="line-clamp-1">{latestCommit.message}</span>
-            ) : (
-              <span>No commits yet</span>
-            )}
-          </div>
-          <ScrollArea className="h-[calc(100vh-290px)] min-h-[360px]">
-            {path && (
-              <button
-                className="grid w-full grid-cols-[24px_1fr_auto] items-center gap-3 border-b px-4 py-2 text-left text-sm hover:bg-muted/40"
-                onClick={() => setPath(parentPath(path))}
+            <label className="inline-flex items-center gap-2 rounded-lg border border-[#d0d7de] bg-white px-3 py-2 text-sm text-[#24292f]">
+              <GitBranch className="h-4 w-4 text-[#57606a]" />
+              <select
+                className="min-w-32 bg-transparent outline-none"
+                value={activeRev}
+                onChange={(event) => setRev(event.target.value)}
               >
-                <Folder className="h-4 w-4 text-[#54aeff]" />
-                <span>..</span>
-                <span />
-              </button>
-            )}
-            {sortedEntries.map((entry) => (
-              <button
-                key={entry.path}
-                className="grid w-full grid-cols-[24px_1fr_auto] items-center gap-3 border-b px-4 py-2 text-left text-sm hover:bg-muted/40"
-                onClick={() => {
-                  if (entry.kind === 'dir') {
-                    setPath(entry.path);
-                    setSelectedFile('');
-                  } else {
-                    setSelectedFile(entry.path);
-                  }
-                }}
-              >
-                {entry.kind === 'dir' ? (
-                  <Folder className="h-4 w-4 text-[#54aeff]" />
-                ) : (
-                  <File className="h-4 w-4 text-muted-foreground" />
-                )}
-                <span className="truncate font-medium">{entry.name}</span>
-                <span className="text-xs text-muted-foreground">{formatBytes(entry.size)}</span>
-              </button>
-            ))}
-            {sortedEntries.length === 0 && (
-              <div className="p-6 text-sm text-muted-foreground">This directory is empty.</div>
-            )}
-          </ScrollArea>
-        </div>
+                {branchesQuery.data.map((branch) => (
+                  <option key={branch} value={branch}>
+                    {branch}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
 
-        {selectedFile ? (
-          <FileViewer repoId={selectedRepoId} path={selectedFile} rev={rev || undefined} />
-        ) : (
-          <div className="flex min-h-[360px] items-center justify-center rounded-md border bg-[#f6f8fa] text-sm text-muted-foreground">
-            <div className="flex items-center gap-2">
-              <Code2 className="h-4 w-4" />
-              Select a file to open it.
+          <div className="mt-6 grid gap-4 lg:grid-cols-4">
+            <div className="rounded-xl border border-[#d8dee4] bg-[#f6f8fa] p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#24292f]">
+                <GitBranch className="h-4 w-4 text-[#57606a]" />
+                Active branch
+              </div>
+              <div className="mt-3 text-2xl font-semibold text-[#0969da]">{statusQuery.data?.branch ?? activeRev}</div>
+              <p className="mt-1 text-xs text-[#57606a]">Browsing repository state from the selected ref.</p>
+            </div>
+
+            <div className="rounded-xl border border-[#d8dee4] bg-[#f6f8fa] p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#24292f]">
+                <GitCommit className="h-4 w-4 text-[#57606a]" />
+                Commits
+              </div>
+              <div className="mt-3 text-2xl font-semibold text-[#24292f]">{commitsQuery.data.length}</div>
+              <p className="mt-1 text-xs text-[#57606a]">First-parent history available from the Rust API.</p>
+            </div>
+
+            <div className="rounded-xl border border-[#d8dee4] bg-[#f6f8fa] p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#24292f]">
+                <Layers3 className="h-4 w-4 text-[#57606a]" />
+                Entries in view
+              </div>
+              <div className="mt-3 text-2xl font-semibold text-[#24292f]">{sortedEntries.length}</div>
+              <p className="mt-1 text-xs text-[#57606a]">Folders and files inside the current tree path.</p>
+            </div>
+
+            <div className="rounded-xl border border-[#d8dee4] bg-[#f6f8fa] p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#24292f]">
+                <CircleDot className="h-4 w-4 text-[#57606a]" />
+                Working tree
+              </div>
+              <div className="mt-3 text-sm font-semibold text-[#24292f]">
+                {statusQuery.data &&
+                statusQuery.data.staged.length === 0 &&
+                statusQuery.data.unstaged.length === 0 &&
+                statusQuery.data.untracked.length === 0
+                  ? 'Clean'
+                  : 'Changes pending'}
+              </div>
+              <p className="mt-1 text-xs text-[#57606a]">
+                {statusQuery.data
+                  ? `${statusQuery.data.staged.length} staged, ${statusQuery.data.unstaged.length} modified, ${statusQuery.data.untracked.length} untracked`
+                  : 'Status unavailable'}
+              </p>
             </div>
           </div>
-        )}
+        </section>
+
+        <section className="rounded-xl border border-[#d0d7de] bg-white px-4 py-3 shadow-sm">
+          <div className="flex flex-wrap items-center gap-1 text-sm text-[#57606a]">
+            <button className="rounded px-2 py-1 font-medium text-[#0969da] hover:bg-[#ddf4ff]" onClick={() => setPath('')}>
+              {selectedRepo?.name}
+            </button>
+            {crumbs.map((crumb, index) => {
+              const nextPath = crumbs.slice(0, index + 1).join('/');
+              return (
+                <span key={nextPath} className="inline-flex items-center gap-1">
+                  <ChevronRight className="h-4 w-4" />
+                  <button className="rounded px-2 py-1 hover:bg-[#f6f8fa]" onClick={() => setPath(nextPath)}>
+                    {crumb}
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        </section>
+
+        <div className="grid min-h-0 gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <div className="space-y-6">
+            <FileExplorer
+              branchLabel={activeRev}
+              currentPath={path}
+              entries={sortedEntries}
+              selectedFile={selectedFile}
+              onNavigateUp={() => setPath(parentPath(path))}
+              onOpenDirectory={(nextPath) => {
+                setPath(nextPath);
+                setSelectedFile('');
+              }}
+              onSelectFile={setSelectedFile}
+            />
+
+            <section className="rounded-xl border border-[#d0d7de] bg-white p-4 shadow-sm">
+              <div className="flex items-center gap-2 text-sm font-semibold text-[#24292f]">
+                <History className="h-4 w-4 text-[#57606a]" />
+                Latest commit
+              </div>
+              {latestCommit ? (
+                <>
+                  <div className="mt-3 text-base font-semibold text-[#24292f]">{latestCommit.message}</div>
+                  <div className="mt-2 text-sm text-[#57606a]">{latestCommit.author}</div>
+                  <div className="mt-1 font-mono text-xs text-[#57606a]">{latestCommit.hash}</div>
+                </>
+              ) : (
+                <p className="mt-3 text-sm text-[#57606a]">This repository has no commits yet.</p>
+              )}
+            </section>
+          </div>
+
+          <CodeViewer repoId={selectedRepoId} path={selectedFile} rev={rev || undefined} />
+        </div>
       </div>
     </div>
   );

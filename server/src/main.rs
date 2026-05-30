@@ -1,5 +1,6 @@
 use async_recursion::async_recursion;
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
@@ -9,7 +10,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -23,7 +23,8 @@ use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 
 use aura_control::{
-    object::{self, Blob, Commit, ObjectKind, Tree},
+    pack::Packfile,
+    object::{self, Tree},
     refs, ChangeKind, Repository,
 };
 
@@ -161,21 +162,6 @@ struct HubItemRequest {
     body: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransportObject {
-    oid: String,
-    kind: String,
-    body_base64: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransportPack {
-    repo_id: String,
-    branch: String,
-    oid: String,
-    objects: Vec<TransportObject>,
-}
-
 #[derive(Serialize)]
 struct RemoteConfig {
     name: String,
@@ -267,6 +253,14 @@ async fn get_log(
     let repo_record = resolve_repo_record(&state, query.repo.as_deref()).await?;
     let repo = Repository::new(PathBuf::from(&repo_record.path));
     let log = repo.log().await.unwrap_or_default();
+    let branch_names = refs::list_branches(repo.filesystem(), &repo.path).await?;
+    let mut refs_by_oid: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for branch in branch_names {
+        if let Some(oid) = refs::read_branch(repo.filesystem(), &repo.path, &branch).await? {
+            refs_by_oid.entry(oid).or_default().push(branch);
+        }
+    }
 
     let commits: Vec<_> = log
         .into_iter()
@@ -276,6 +270,8 @@ async fn get_log(
                 "author": commit.author,
                 "message": commit.message,
                 "date": commit.timestamp.to_rfc3339(),
+                "parents": commit.parents,
+                "refs": refs_by_oid.get(&commit.oid).cloned().unwrap_or_default(),
             })
         })
         .collect();
@@ -611,47 +607,28 @@ async fn export_pack(
             .await?
             .unwrap_or_else(|| "main".to_string()),
     };
-    let oid = refs::read_branch(repo.filesystem(), &repo.path, &branch)
-        .await?
-        .ok_or_else(|| {
-            AppError::not_found(format!(
-                "В репозитории `{}` нет ветки `{branch}`",
-                repo_record.id
-            ))
-        })?;
-    let objects = collect_pack(&repo, &oid).await?;
-
-    Ok(Json(TransportPack {
-        repo_id: repo_record.id,
-        branch,
-        oid,
-        objects,
-    })
-    .into_response())
+    let pack = repo.export_pack(&branch, &std::collections::BTreeSet::new()).await?;
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/x-aura-pack")],
+        pack.to_bytes().map_err(AppError::bad_request)?,
+    )
+        .into_response())
 }
 
 async fn import_pack(
     State(state): State<Arc<AppState>>,
     Path(repo_id): Path<String>,
-    Json(payload): Json<TransportPack>,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    if repo_id != payload.repo_id {
-        return Err(AppError::bad_request(
-            "repo id in URL and payload must match",
-        ));
-    }
-
     let _guard = state.repo_lock.lock().await;
     let repo_record = ensure_hosted_repo(&state, &repo_id, None).await?;
     let repo = Repository::new(PathBuf::from(&repo_record.path));
     repo.init_repository().await?;
-
-    for packed in &payload.objects {
-        write_transport_object(&repo, packed).await?;
-    }
-
-    refs::write_branch(repo.filesystem(), &repo.path, &payload.branch, &payload.oid).await?;
-    repo.materialize_branch(&payload.branch).await?;
+    let pack = Packfile::from_bytes(body.as_ref()).map_err(AppError::bad_request)?;
+    let object_count = repo.import_pack(&pack).await?;
+    refs::write_branch(repo.filesystem(), &repo.path, &pack.branch, &pack.head).await?;
+    repo.materialize_branch(&pack.branch).await?;
 
     let _ = state.tx.send(Event::RepoUpdated {
         repo_id: repo_record.id.clone(),
@@ -660,9 +637,9 @@ async fn import_pack(
 
     Ok(Json(json!({
         "repo_id": repo_record.id,
-        "branch": payload.branch,
-        "hash": payload.oid,
-        "object_count": payload.objects.len(),
+        "branch": pack.branch,
+        "hash": pack.head,
+        "object_count": object_count,
         "path": repo_record.path,
     }))
     .into_response())
@@ -712,115 +689,6 @@ async fn list_remotes(repo: &Repository) -> Result<Vec<RemoteConfig>, AppError> 
     }
 
     Ok(remotes)
-}
-
-async fn collect_pack(repo: &Repository, oid: &str) -> Result<Vec<TransportObject>, AppError> {
-    let mut seen = BTreeSet::new();
-    let mut objects = Vec::new();
-    collect_commit_objects(repo, oid, &mut seen, &mut objects).await?;
-    Ok(objects)
-}
-
-#[async_recursion]
-async fn collect_commit_objects(
-    repo: &Repository,
-    oid: &str,
-    seen: &mut BTreeSet<String>,
-    objects: &mut Vec<TransportObject>,
-) -> Result<(), AppError> {
-    if !seen.insert(oid.to_string()) {
-        return Ok(());
-    }
-
-    let commit = object::read_commit(repo.filesystem(), &repo.path, oid).await?;
-    objects.push(TransportObject {
-        oid: oid.to_string(),
-        kind: "commit".to_string(),
-        body_base64: STANDARD.encode(commit.serialize()),
-    });
-
-    collect_tree_objects(repo, &commit.tree, seen, objects).await?;
-    for parent in &commit.parents {
-        collect_commit_objects(repo, parent, seen, objects).await?;
-    }
-
-    Ok(())
-}
-
-#[async_recursion]
-async fn collect_tree_objects(
-    repo: &Repository,
-    oid: &str,
-    seen: &mut BTreeSet<String>,
-    objects: &mut Vec<TransportObject>,
-) -> Result<(), AppError> {
-    if !seen.insert(oid.to_string()) {
-        return Ok(());
-    }
-
-    let tree = object::read_tree(repo.filesystem(), &repo.path, oid).await?;
-    objects.push(TransportObject {
-        oid: oid.to_string(),
-        kind: "tree".to_string(),
-        body_base64: STANDARD.encode(tree.serialize()?),
-    });
-
-    for entry in &tree.entries {
-        if entry.mode == "40000" {
-            collect_tree_objects(repo, &entry.oid, seen, objects).await?;
-        } else {
-            collect_blob_object(repo, &entry.oid, seen, objects).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn collect_blob_object(
-    repo: &Repository,
-    oid: &str,
-    seen: &mut BTreeSet<String>,
-    objects: &mut Vec<TransportObject>,
-) -> Result<(), AppError> {
-    if !seen.insert(oid.to_string()) {
-        return Ok(());
-    }
-
-    let blob = object::read_blob(repo.filesystem(), &repo.path, oid).await?;
-    objects.push(TransportObject {
-        oid: oid.to_string(),
-        kind: "blob".to_string(),
-        body_base64: STANDARD.encode(blob.serialize()),
-    });
-
-    Ok(())
-}
-
-async fn write_transport_object(
-    repo: &Repository,
-    packed: &TransportObject,
-) -> Result<(), AppError> {
-    let body = STANDARD
-        .decode(&packed.body_base64)
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
-    let kind = ObjectKind::from_str(&packed.kind)
-        .map_err(|error| AppError::bad_request(error.to_string()))?;
-
-    match kind {
-        ObjectKind::Blob => {
-            object::write_blob(repo.filesystem(), &repo.path, &Blob::deserialize(&body)).await?;
-        }
-        ObjectKind::Tree => {
-            let tree = Tree::deserialize(&body)?;
-            object::write_tree(repo.filesystem(), &repo.path, &tree).await?;
-        }
-        ObjectKind::Commit => {
-            let commit = Commit::deserialize(&body)?;
-            object::write_commit(repo.filesystem(), &repo.path, &commit).await?;
-        }
-    }
-
-    Ok(())
 }
 
 async fn resolve_commit_oid(
@@ -1373,28 +1241,18 @@ mod tests {
         let storage_root = temp_path("transport-storage");
         let local_repo = temp_path("transport-local");
         let repo = create_commit(&local_repo, "hello.txt", "first hosted commit").await;
-        let oid = refs::read_branch(repo.filesystem(), &repo.path, "main")
+        let pack = repo
+            .export_pack("main", &std::collections::BTreeSet::new())
             .await
-            .expect("main should be readable")
-            .expect("main should exist");
-        let pack = TransportPack {
-            repo_id: "demo".to_string(),
-            branch: "main".to_string(),
-            oid: oid.clone(),
-            objects: collect_pack(&repo, &oid)
-                .await
-                .expect("pack should be built"),
-        };
+            .expect("pack should be built");
 
         let app = build_app(init_state(&storage_root).await.expect("state should init"));
         let response = app
             .clone()
             .oneshot(
                 Request::post("/api/transport/repos/demo/push")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_string(&pack).expect("pack should serialize"),
-                    ))
+                    .header("content-type", "application/x-aura-pack")
+                    .body(Body::from(pack.to_bytes().expect("pack should serialize")))
                     .expect("request should build"),
             )
             .await
@@ -1457,12 +1315,15 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        assert_eq!(body["oid"], oid);
-        assert!(body["objects"]
-            .as_array()
-            .expect("objects should be array")
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let pack = Packfile::from_bytes(&bytes).expect("pack should decode");
+        assert_eq!(pack.head, oid);
+        assert_eq!(pack.branch, "main");
+        assert!(pack
+            .objects
             .iter()
-            .any(|value| value["kind"] == "commit"));
+            .any(|value| matches!(value.kind, aura_control::object::ObjectKind::Commit)));
     }
 }

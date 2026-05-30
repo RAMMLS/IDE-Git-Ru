@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub mod index;
 pub mod object;
+pub mod pack;
 pub mod refs;
 mod repository;
 
@@ -48,6 +49,9 @@ pub enum AuraError {
     /// Hex conversion failed while decoding object ids.
     #[error("hex decoding error: {0}")]
     Hex(#[from] hex::FromHexError),
+    /// HTTP transport request failed.
+    #[error("http transport error: {0}")]
+    Reqwest(#[from] reqwest::Error),
     /// A path does not belong to the repository worktree.
     #[error("path `{0}` is outside of the repository root")]
     PathOutsideRepository(String),
@@ -76,6 +80,9 @@ pub enum AuraError {
     /// An object could not be parsed from its raw representation.
     #[error("corrupt object `{0}`")]
     CorruptObject(String),
+    /// A transport packfile is malformed or unsupported.
+    #[error("invalid packfile: {0}")]
+    InvalidPackfile(String),
     /// A named reference could not be resolved.
     #[error("reference `{0}` not found")]
     ReferenceNotFound(String),
@@ -116,6 +123,9 @@ pub enum AuraError {
     /// Checkout or pull would overwrite an untracked path in the working tree.
     #[error("operation would overwrite untracked path `{0}`")]
     UntrackedWouldBeOverwritten(String),
+    /// Remote transport returned an invalid response.
+    #[error("transport error: {0}")]
+    Transport(String),
 }
 
 /// Timestamp captured from the backing filesystem.

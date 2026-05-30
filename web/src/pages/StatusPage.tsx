@@ -300,7 +300,7 @@ export function StatusPage() {
                 <CardDescription>{getErrorMessage(statusQuery.error)}</CardDescription>
               </CardHeader>
               <CardContent className="text-sm text-muted-foreground">
-                Start the Rust server on port `3000` or use the Vite proxy from `client/vite.config.ts`.
+                Start the Rust server on port `3000` or use the Vite proxy from `web/vite.config.ts`.
               </CardContent>
             </Card>
           ) : selectedRepoId && statusQuery.isLoading ? (

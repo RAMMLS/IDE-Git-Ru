@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
+use reqwest::{Client, StatusCode};
 
 use crate::index::{self, IndexFile};
 use crate::object::{self, Blob, Commit, Tree, TreeEntry};
+use crate::pack::{PackObject, Packfile};
 use crate::refs::{self, HeadRef};
 use crate::{AuraError, FileSystem, Repository, Result, DEFAULT_AUTHOR};
 
@@ -505,6 +507,18 @@ impl Repository {
         let remote_target = refs::read_remote(self.fs.as_ref(), &self.path, &remote_name)
             .await?
             .ok_or_else(|| AuraError::RemoteNotFound(remote_name.clone()))?;
+        if is_http_transport(&remote_target) {
+            let (oid, target) = self
+                .fetch_http_pack(&remote_name, &branch_name, &remote_target)
+                .await?;
+            return Ok(FetchSummary {
+                remote: remote_name,
+                branch: branch_name,
+                oid,
+                target,
+            });
+        }
+
         let target = PathBuf::from(remote_target);
         let remote_repo = Repository::with_fs(target.clone(), self.fs.clone());
         if !self.fs.exists(&remote_repo.aura_dir()).await? {
@@ -555,6 +569,40 @@ impl Repository {
         let remote_target = refs::read_remote(self.fs.as_ref(), &self.path, &remote_name)
             .await?
             .ok_or_else(|| AuraError::RemoteNotFound(remote_name.clone()))?;
+        if is_http_transport(&remote_target) {
+            let tracked_oid =
+                refs::read_remote_branch(self.fs.as_ref(), &self.path, &remote_name, &branch_name)
+                    .await?;
+            let have = match tracked_oid.as_deref() {
+                Some(oid) if self.object_exists(oid).await? => self.reachable_object_ids(oid).await?,
+                _ => BTreeSet::new(),
+            };
+            let pack = self.export_pack(&branch_name, &have).await?;
+            let url = format!("{}/push", normalize_transport_target(&remote_target));
+            let response = Client::new()
+                .post(url)
+                .header("content-type", "application/x-aura-pack")
+                .header("accept", "application/json")
+                .body(pack.to_bytes()?)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AuraError::Transport(format!(
+                    "push failed with status {status}: {body}"
+                )));
+            }
+            refs::write_remote_branch(self.fs.as_ref(), &self.path, &remote_name, &branch_name, &oid)
+                .await?;
+            return Ok(PushSummary {
+                remote: remote_name,
+                branch: branch_name,
+                oid,
+                target: PathBuf::from(remote_target),
+            });
+        }
+
         let target = PathBuf::from(remote_target);
 
         let remote_repo = Repository::with_fs(target.clone(), self.fs.clone());
@@ -592,6 +640,15 @@ impl Repository {
         let remote_target = refs::read_remote(self.fs.as_ref(), &self.path, &remote_name)
             .await?
             .ok_or_else(|| AuraError::RemoteNotFound(remote_name.clone()))?;
+        if is_http_transport(&remote_target) {
+            let (remote_oid, remote_path) = self
+                .fetch_http_pack(&remote_name, &source_branch, &remote_target)
+                .await?;
+            return self
+                .complete_pull_from_fetched(remote_name, source_branch, local_branch, remote_path, remote_oid)
+                .await;
+        }
+
         let remote_path = PathBuf::from(remote_target);
         let remote_repo = Repository::with_fs(remote_path.clone(), self.fs.clone());
         if !self.fs.exists(&remote_repo.aura_dir()).await? {
@@ -683,6 +740,36 @@ impl Repository {
             stats: Some(stats),
             target: remote_path,
         })
+    }
+
+    /// Builds a packfile for the requested branch, skipping object ids already known by the receiver.
+    pub async fn export_pack(&self, branch: &str, known: &BTreeSet<String>) -> Result<Packfile> {
+        self.ensure_initialized().await?;
+
+        let head = refs::read_branch(self.fs.as_ref(), &self.path, branch)
+            .await?
+            .ok_or_else(|| AuraError::BranchNotFound(branch.to_string()))?;
+        let mut seen = known.clone();
+        let mut objects = Vec::new();
+        self.collect_commit_pack_objects(&head, &mut seen, &mut objects)
+            .await?;
+
+        Ok(Packfile {
+            branch: branch.to_string(),
+            head,
+            objects,
+        })
+    }
+
+    /// Writes every object stored in the packfile into the local object database.
+    pub async fn import_pack(&self, pack: &Packfile) -> Result<usize> {
+        self.ensure_initialized().await?;
+
+        for object in &pack.objects {
+            object::write_object(self.fs.as_ref(), &self.path, object.kind, &object.body).await?;
+        }
+
+        Ok(pack.objects.len())
     }
 
     /// Merges another branch into the current branch.
@@ -991,6 +1078,61 @@ impl Repository {
         Ok(diffs)
     }
 
+    /// Produces a line-oriented diff between `HEAD` and the current worktree.
+    ///
+    /// Unlike [`Repository::diff`], this view includes staged changes as well,
+    /// which makes it suitable for UI diff viewers that want to preview the
+    /// full pending state of a path before commit.
+    pub async fn diff_head_to_worktree(&self) -> Result<Vec<FileDiff>> {
+        self.ensure_initialized().await?;
+
+        let head = refs::resolve_head(self.fs.as_ref(), &self.path).await?;
+        let head_map = match head.as_deref() {
+            Some(oid) => {
+                let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+                self.collect_tree_entries(&commit.tree).await?
+            }
+            None => BTreeMap::new(),
+        };
+        let worktree = self.collect_worktree_oids().await?;
+
+        let mut all_paths = BTreeSet::new();
+        all_paths.extend(head_map.keys().cloned());
+        all_paths.extend(worktree.keys().cloned());
+
+        let mut diffs = Vec::new();
+        for path in all_paths {
+            let old_bytes = match head_map.get(&path) {
+                Some(oid) => {
+                    object::read_blob(self.fs.as_ref(), &self.path, oid)
+                        .await?
+                        .content
+                }
+                None => Vec::new(),
+            };
+
+            let absolute = self.path.join(repo_path_to_native(&path));
+            let new_bytes = if self.fs.exists(&absolute).await? {
+                self.fs.read(&absolute).await?
+            } else {
+                Vec::new()
+            };
+
+            if old_bytes == new_bytes {
+                continue;
+            }
+
+            let old_text = String::from_utf8_lossy(&old_bytes).into_owned();
+            let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
+            diffs.push(FileDiff {
+                path: repo_path_to_native(&path),
+                lines: myers_diff(&old_text, &new_text),
+            });
+        }
+
+        Ok(diffs)
+    }
+
     async fn ensure_worktree_clean(&self) -> Result<()> {
         let status = self.status().await?;
         if !status.staged.is_empty() || !status.unstaged.is_empty() {
@@ -1268,6 +1410,255 @@ impl Repository {
         let blob = object::read_blob(self.fs.as_ref(), &self.path, oid).await?;
         object::write_blob(destination.fs.as_ref(), &destination.path, &blob).await?;
         Ok(())
+    }
+
+    #[async_recursion]
+    async fn collect_commit_pack_objects(
+        &self,
+        oid: &str,
+        seen: &mut BTreeSet<String>,
+        objects: &mut Vec<PackObject>,
+    ) -> Result<()> {
+        if !seen.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let stored = object::read_object(self.fs.as_ref(), &self.path, oid).await?;
+        objects.push(PackObject {
+            oid: oid.to_string(),
+            kind: stored.kind,
+            body: stored.body,
+        });
+        let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+        self.collect_tree_pack_objects(&commit.tree, seen, objects).await?;
+
+        for parent in &commit.parents {
+            self.collect_commit_pack_objects(parent, seen, objects).await?;
+        }
+
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn collect_tree_pack_objects(
+        &self,
+        oid: &str,
+        seen: &mut BTreeSet<String>,
+        objects: &mut Vec<PackObject>,
+    ) -> Result<()> {
+        if !seen.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let stored = object::read_object(self.fs.as_ref(), &self.path, oid).await?;
+        objects.push(PackObject {
+            oid: oid.to_string(),
+            kind: stored.kind,
+            body: stored.body,
+        });
+        let tree = object::read_tree(self.fs.as_ref(), &self.path, oid).await?;
+
+        for entry in tree.entries {
+            if entry.mode == DIRECTORY_MODE_TREE {
+                self.collect_tree_pack_objects(&entry.oid, seen, objects).await?;
+            } else {
+                self.collect_blob_pack_objects(&entry.oid, seen, objects).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn collect_blob_pack_objects(
+        &self,
+        oid: &str,
+        seen: &mut BTreeSet<String>,
+        objects: &mut Vec<PackObject>,
+    ) -> Result<()> {
+        if !seen.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let stored = object::read_object(self.fs.as_ref(), &self.path, oid).await?;
+        objects.push(PackObject {
+            oid: oid.to_string(),
+            kind: stored.kind,
+            body: stored.body,
+        });
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn reachable_object_ids_from_commit(
+        &self,
+        oid: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !seen.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+        self.reachable_object_ids_from_tree(&commit.tree, seen).await?;
+        for parent in commit.parents {
+            self.reachable_object_ids_from_commit(&parent, seen).await?;
+        }
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn reachable_object_ids_from_tree(
+        &self,
+        oid: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !seen.insert(oid.to_string()) {
+            return Ok(());
+        }
+
+        let tree = object::read_tree(self.fs.as_ref(), &self.path, oid).await?;
+        for entry in tree.entries {
+            if entry.mode == DIRECTORY_MODE_TREE {
+                self.reachable_object_ids_from_tree(&entry.oid, seen).await?;
+            } else {
+                seen.insert(entry.oid);
+            }
+        }
+        Ok(())
+    }
+
+    async fn reachable_object_ids(&self, oid: &str) -> Result<BTreeSet<String>> {
+        let mut seen = BTreeSet::new();
+        self.reachable_object_ids_from_commit(oid, &mut seen).await?;
+        Ok(seen)
+    }
+
+    async fn object_exists(&self, oid: &str) -> Result<bool> {
+        self.fs.exists(&object::object_path(&self.path, oid)?).await
+    }
+
+    async fn fetch_http_pack(
+        &self,
+        remote_name: &str,
+        branch_name: &str,
+        remote_target: &str,
+    ) -> Result<(String, PathBuf)> {
+        let url = format!("{}/export", normalize_transport_target(remote_target));
+        let response = Client::new()
+            .get(url)
+            .header("accept", "application/x-aura-pack")
+            .query(&[("branch", branch_name)])
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(AuraError::RemoteBranchNotFound {
+                remote: remote_name.to_string(),
+                branch: branch_name.to_string(),
+            });
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AuraError::Transport(format!(
+                "export failed with status {status}: {body}"
+            )));
+        }
+
+        let pack = Packfile::from_bytes(response.bytes().await?.as_ref())?;
+        if pack.branch != branch_name {
+            return Err(AuraError::Transport(format!(
+                "remote returned branch `{}` instead of `{branch_name}`",
+                pack.branch
+            )));
+        }
+
+        self.import_pack(&pack).await?;
+        refs::write_remote_branch(
+            self.fs.as_ref(),
+            &self.path,
+            remote_name,
+            branch_name,
+            &pack.head,
+        )
+        .await?;
+
+        Ok((pack.head, PathBuf::from(remote_target)))
+    }
+
+    async fn complete_pull_from_fetched(
+        &self,
+        remote_name: String,
+        source_branch: String,
+        local_branch: String,
+        remote_path: PathBuf,
+        remote_oid: String,
+    ) -> Result<PullSummary> {
+        let previous_oid = refs::read_branch(self.fs.as_ref(), &self.path, &local_branch).await?;
+        if previous_oid.as_deref() == Some(remote_oid.as_str()) {
+            return Ok(PullSummary {
+                remote: remote_name,
+                source_branch,
+                local_branch,
+                oid: remote_oid,
+                previous_oid,
+                status: PullStatus::AlreadyUpToDate,
+                stats: None,
+                target: remote_path,
+            });
+        }
+
+        if let Some(local_oid) = previous_oid.as_deref() {
+            if self.is_ancestor(&remote_oid, local_oid).await? {
+                return Ok(PullSummary {
+                    remote: remote_name,
+                    source_branch,
+                    local_branch,
+                    oid: local_oid.to_string(),
+                    previous_oid,
+                    status: PullStatus::AlreadyUpToDate,
+                    stats: None,
+                    target: remote_path,
+                });
+            }
+
+            if !self.is_ancestor(local_oid, &remote_oid).await? {
+                return Err(AuraError::DivergedBranches {
+                    local: local_branch,
+                    remote: format!("{remote_name}/{source_branch}"),
+                });
+            }
+        }
+
+        let current = match previous_oid.as_deref() {
+            Some(oid) => {
+                let commit = object::read_commit(self.fs.as_ref(), &self.path, oid).await?;
+                self.collect_tree_entries(&commit.tree).await?
+            }
+            None => BTreeMap::new(),
+        };
+        let target_commit = object::read_commit(self.fs.as_ref(), &self.path, &remote_oid).await?;
+        let target_map = self.collect_tree_entries(&target_commit.tree).await?;
+        self.ensure_worktree_can_apply_target(&current, &target_map)
+            .await?;
+        let stats = self
+            .diff_stats_between_commits(previous_oid.as_deref(), Some(remote_oid.as_str()))
+            .await?;
+        self.apply_snapshot_to_worktree(&current, &target_map)
+            .await?;
+        refs::write_branch(self.fs.as_ref(), &self.path, &local_branch, &remote_oid).await?;
+
+        Ok(PullSummary {
+            remote: remote_name,
+            source_branch,
+            local_branch,
+            oid: remote_oid,
+            previous_oid,
+            status: PullStatus::FastForward,
+            stats: Some(stats),
+            target: remote_path,
+        })
     }
 
     async fn collect_worktree_oids(&self) -> Result<BTreeMap<String, String>> {
@@ -1763,6 +2154,14 @@ fn myers_diff(old: &str, new: &str) -> Vec<DiffLine> {
 
     result.reverse();
     result
+}
+
+fn is_http_transport(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn normalize_transport_target(target: &str) -> String {
+    target.trim_end_matches('/').to_string()
 }
 
 #[cfg(test)]

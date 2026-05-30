@@ -30,6 +30,8 @@ export interface Commit {
   author: string;
   message: string;
   date: string;
+  parents: string[];
+  refs: string[];
 }
 
 export interface FileDiff {
